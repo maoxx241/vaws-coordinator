@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from vaws_diagnostics import get_recorder, current_context
+from remote_dev.observability import observed_operation
 
 from remote_dev.core.ssh_transport import RemoteCompleted
 from remote_dev.processes import control
@@ -22,7 +24,23 @@ def _remember(record, observation, save):
     # Output belongs to the step log, not the execution database. Keep the
     # receipt, outcome and cursors needed to observe/stop after daemon restart.
     record.update({key: value for key, value in observation.items()
-                   if key not in {"stdout", "stderr", "processes", "timings"}})
+                   if key not in {"stdout", "stderr", "processes", "timings", "transport"}})
+    if (observation.get("result") or {}).get("timings"):
+        record["command_timings"] = observation["result"]["timings"]
+    for key in ("timings", "transport"):
+        if observation.get(key):
+            # Preserve the launch phases and accumulate bounded exchange costs;
+            # a later status-only observation cannot erase earlier evidence.
+            if key == "timings":
+                record.setdefault("timings", {}).update(observation[key])
+            else:
+                totals = record.setdefault("transport_totals", {"observations": 0})
+                totals["observations"] += 1
+                for name in ("connection_wait_ms", "rpc_ms", "pool_wait_ms"):
+                    if isinstance(observation[key].get(name), (int, float)):
+                        totals[name] = totals.get(name, 0) + observation[key][name]
+            get_recorder("vaws-coordinator").event("DEBUG", "preparation.observation", job_id=record["job_id"],
+                phase=record.get("step"), **observation[key])
     record["observed_at"] = time.time()
     save(record)
 
@@ -54,6 +72,7 @@ class PreparationProcess:
         self.setup = list(setup)
         self.bootstrap_root = bootstrap_root
 
+    @observed_operation("preparation.command", component="vaws-coordinator")
     def run(self, script, *, on_output):
         started = time.monotonic()
         if self.cancel_requested():
@@ -65,7 +84,7 @@ class PreparationProcess:
         command = preparation_command(script, setup=setup, cwd=(self.endpoint.get('cwd') or self.endpoint['root']) if setup else None)
         record = {"endpoint": endpoint, "job_id": "prepare-" + uuid.uuid4().hex,
                   "step": self.step, "state": "pending", "quiet": False,
-                  "stdout_offset": 0, "stderr_offset": 0}
+                  "stdout_offset": 0, "stderr_offset": 0, "diagnostics_context": current_context()}
         def save_record(value):
             value['elapsed_seconds'] = round(time.monotonic() - started, 6)
             self.save(value)

@@ -14,6 +14,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from vaws_diagnostics import get_recorder, current_context
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -22,6 +23,7 @@ from vaws_coordinator.runtime_profile import digest
 from vaws_coordinator.run_manifest import utc_now
 
 TERMINAL = {"released", "cancelled", "expired"}
+_PROCESS_INSTANCE = uuid.uuid4().hex
 
 
 def safe_id(value: str) -> str:
@@ -114,8 +116,11 @@ class RuntimePool(ManagedExecution):
         return row
 
     def event(self, db, owner, kind, **data):
-        event = {"kind": kind, "at": self.clock(), **data}
+        event = {"kind": kind, "at": self.clock(), "monotonic_ns": time.monotonic_ns(),
+                 "process_instance_id": _PROCESS_INSTANCE, "diagnostics_context": current_context(), **data}
         cur = db.execute("INSERT INTO events(owner,data) VALUES(?,?)", (owner, json.dumps(event)))
+        get_recorder("vaws-coordinator").event("DEBUG", "pool." + kind,
+            **{key: value for key, value in data.items() if key in {"run", "job_id", "state", "operation", "elapsed_seconds"}})
         return {"cursor": cur.lastrowid, **event}
 
     def session_open(self, owner: str, session_id: str, sources: dict[str, str]):
@@ -524,12 +529,35 @@ class RuntimePool(ManagedExecution):
         """Bounded lifecycle evidence; never record command text or heartbeat polls."""
         started = time.monotonic()
         try:
-            yield
+            with get_recorder("vaws-coordinator").operation("run." + operation, run_id=run["id"]):
+                yield
         finally:
             elapsed = time.monotonic() - started
-            with self.transaction() as db:
-                self.event(db, run["owner"], "run-operation", run=run["id"], operation=operation,
-                           elapsed_seconds=round(elapsed, 6))
+            # This event is a diagnostic projection, not lifecycle authority.
+            # A full log disk must not turn a completed release into a failure.
+            try:
+                with self.transaction() as db:
+                    self.event(db, run["owner"], "run-operation", run=run["id"], operation=operation,
+                               elapsed_seconds=round(elapsed, 6))
+            except Exception as exc:
+                get_recorder("vaws-coordinator").event("WARNING", "diagnostics.persistence_failed",
+                    error_type=type(exc).__name__, run_id=run["id"])
+
+    def diagnostic_events(self, owner, run_ids, *, limit=128):
+        """Read only events for exact owned runs; never query or housekeep a host."""
+        keys = list(dict.fromkeys(run_ids))[:64]
+        if not keys:
+            return {"operations": [], "truncated": False}
+        limit = max(1, min(512, int(limit)))
+        uri = self.db_path.resolve().as_uri() + "?mode=ro"
+        with contextlib.closing(sqlite3.connect(uri, uri=True)) as db:
+            for key in keys:
+                self.owned(db, "run", key, owner)
+            marks = ",".join("?" for _ in keys)
+            rows = db.execute("SELECT id,data FROM events WHERE owner=? AND json_extract(data,'$.run') IN (" + marks + ") ORDER BY id DESC LIMIT ?",
+                              (owner, *keys, limit + 1)).fetchall()
+        return {"operations": [{"cursor": identifier, **json.loads(data)} for identifier, data in reversed(rows[:limit])],
+                "truncated": len(rows) > limit, "basis": "recorded local owner events", "clock_domain": "coordinator-owner"}
 
     def _verify_run_preflight(self, run, runtime, *, managed, container_info=None):
         try:

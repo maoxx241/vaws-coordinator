@@ -9,12 +9,14 @@ import sys
 from pathlib import Path
 
 from remote_dev.result import make_result
+from remote_dev.observability import observed_tool
 
 from vaws_coordinator.agent_session import CLIENTS, AgentSessions, load_context
 from vaws_coordinator.ops import vaws_call
 from vaws_coordinator.task_client import TaskClient
 
 
+@observed_tool(lambda tool, **kwargs: tool, component="vaws-coordinator")
 def error_payload(tool: str, *, outcome: str, status: str, error: str) -> dict:
     """Same result contract as the remote-dev CLI wrappers: errors print a
     result JSON (never a traceback) and exit non-zero."""
@@ -25,7 +27,8 @@ def error_payload(tool: str, *, outcome: str, status: str, error: str) -> dict:
         status=status,
         summary=f"{tool} {status}.",
         preview={"stderr": error[-4000:]},
-        extra={"error": error},
+        extra={"error": error, "error_details": {"category": "caller" if status in {"invalid_json", "invalid_wait", "invalid_sources"} else "internal",
+                                                "submission_state": "not_sent", "retryable": False}},
     )
     return result
 
@@ -72,7 +75,7 @@ def main():
             reference.add_argument("--execution-id")
             reference.add_argument("--service")
             child.add_argument("--action", choices=["status", "wait", "evidence", "tail", "stop", "target"])
-            child.add_argument("--section", choices=["all", "sources", "preparation", "build"])
+            child.add_argument("--section", choices=["all", "sources", "preparation", "build", "diagnostics"])
             child.add_argument("--path", help="Artifact path substring for evidence")
             child.add_argument("--role", default=None)
             child.add_argument("--refresh", action="store_true", default=None,

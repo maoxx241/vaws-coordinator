@@ -356,7 +356,8 @@ class AgentSessions:
             else:
                 row = {"id": key, "session_id": session_id, "request_id": request_id,
                        "spec": spec, "created_at": time.time()}
-            row.update(phase="queued", admitted=True, user=user)
+            from vaws_diagnostics import current_context
+            row.update(phase="queued", admitted=True, user=user, diagnostics_context=current_context())
             self.put(db, "execution", row)
             return row
 

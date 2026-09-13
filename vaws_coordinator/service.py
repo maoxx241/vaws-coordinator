@@ -19,6 +19,10 @@ import threading
 import time
 import traceback
 import uuid
+from datetime import datetime, timezone
+from vaws_diagnostics import get_recorder, current_context, bind_context, wrap_context
+from remote_dev.observability import observed_operation, detached_tool
+from remote_dev.core.errors import error_details, RemoteExecutionError
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -54,6 +58,7 @@ SOCKET_NAME = "coordinator.sock"
 LOCK_NAME = "coordinator.lock"
 IPC_NAME = "coordinator.ipc"
 TICK_SECONDS = 2.0
+_PROCESS_CLOCK_DOMAIN = uuid.uuid4().hex
 STATUS_CACHE_SECONDS = 2.0
 DONE = {"succeeded", "failed", "timeout", "cancelled", "inconclusive"}
 LIVE = {"running"}
@@ -122,7 +127,7 @@ def _map_roles(operation, roles):
     if len(roles) <= 1:
         return [operation(role) for role in roles]
     with ThreadPoolExecutor(max_workers=min(4, len(roles)), thread_name_prefix="vaws-role") as workers:
-        return list(workers.map(operation, roles))
+        return list(workers.map(wrap_context(operation), roles))
 
 
 def aggregate_job_states(states: list[str | None]) -> str:
@@ -244,6 +249,11 @@ class CoordinatorService(TaskMessages):
             self._resume_finishing_sessions(directory, store)
 
     def handle(self, request: dict[str, Any]) -> dict[str, Any]:
+        with bind_context(request.get("diagnostics_context") or {}):
+            return self._handle_correlated(request)
+
+    @observed_operation(lambda self, request: "ipc." + str(request.get("op", "unknown")), component="vaws-coordinator", level="DEBUG")
+    def _handle_correlated(self, request: dict[str, Any]) -> dict[str, Any]:
         if request.get("op") == "ping":
             return {"ok": True, "value": {"runtime": [runtime_status(item) for item in LOADED_RUNTIMES]}}
         if request.get("op") == "restart_if_idle":
@@ -373,8 +383,8 @@ class CoordinatorService(TaskMessages):
         if lock.locked():
             return
         threading.Thread(
-            target=self._tick_one,
-            args=(sessions_dir, {"id": execution_id, "user": user}, lock),
+            target=wrap_context(self._tick_one),
+            args=(sessions_dir, {"id": execution_id, "user": user, "diagnostics_context": current_context()}, lock),
             name=f"vaws-progress-{execution_id[:12]}",
             daemon=True,
         ).start()
@@ -989,26 +999,40 @@ class CoordinatorService(TaskMessages):
         # prepare-root replaces the current progress. No remote payloads/keys.
         log = self.state_dir / 'runs' / row['id'] / role / 'prepare-container.log'
         self._save_progress(store, row, role, {**event, 'log_ref': str(log)})
-        with log.open('a', encoding='utf-8') as stream:
-            stream.write(json.dumps(event, ensure_ascii=False) + '\n')
+        try:
+            with log.open('a', encoding='utf-8') as stream:
+                stream.write(json.dumps(event, ensure_ascii=False) + '\n')
+        except OSError as exc:
+            get_recorder("vaws-coordinator").event("WARNING", "diagnostics.persistence_failed", error_type=type(exc).__name__)
 
     def _save_progress(self, store, row, role, event):
         now = time.time()
+        monotonic = time.monotonic()
+        clock_domain = _PROCESS_CLOCK_DOMAIN
         if event.get("log_ref"):
             path = Path(event["log_ref"])
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.touch(exist_ok=True)
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch(exist_ok=True)
+            except OSError as exc:
+                get_recorder("vaws-coordinator").event("WARNING", "diagnostics.persistence_failed", error_type=type(exc).__name__)
         with self._lock_for("progress", row["id"]):
             previous = (row.get("role_progress") or {}).get(role, {}) if role else row.get("progress") or {}
             same_step = (previous.get("step"), previous.get("role")) == (event.get("step"), role)
             if previous.get("started_at") and not same_step:
                 row.setdefault("stage_history", []).append({
                     **previous, "ended_at": now,
-                    "elapsed_seconds": round(max(0, now - previous["started_at"]), 3)})
+                    **({"elapsed_seconds": round(max(0, monotonic - previous["started_monotonic"]), 3)}
+                       if previous.get("clock_domain") == clock_domain and "started_monotonic" in previous else
+                       {"elapsed_seconds": None, "timing_incomplete": "owner clock domain changed"})})
                 row["stage_history"] = row["stage_history"][-64:]
             progress = {**(previous if same_step else {}), **event, "role": role,
                         "started_at": previous.get("started_at", now) if same_step else now,
-                        "updated_at": now}
+                        "updated_at": now,
+                        "started_monotonic": previous.get("started_monotonic", monotonic) if same_step and previous.get("clock_domain") == clock_domain else monotonic,
+                        "clock_domain": clock_domain}
+            if not same_step:
+                get_recorder("vaws-coordinator").event("INFO", "execution.phase", execution_id=row["id"], role=role, phase=event.get("step"))
             row["progress"] = progress
             if role:
                 row.setdefault("role_progress", {})[role] = progress
@@ -1211,20 +1235,25 @@ class CoordinatorService(TaskMessages):
                for job in records.values()):
             permanent = False
         path = self.state_dir / "runs" / row["id"] / "error.log"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as stream:
-            stream.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)) + "\n")
-        row["error_ref"] = str(path)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)) + "\n")
+            row["error_ref"] = str(path)
+        except OSError as log_exc:
+            get_recorder("vaws-coordinator").event("WARNING", "diagnostics.persistence_failed", error_type=type(log_exc).__name__)
         row["error"] = f"{type(exc).__name__}: {exc}"[:500]
+        row["error_details"] = error_details(exc)
         row["phase"] = "failed" if permanent else "uncertain"
         self._save_execution(store, row)
         return self._reply(row)
 
     def _record_daemon_error(self, message: str) -> None:
+        get_recorder("vaws-coordinator").event("ERROR", "daemon.error", message=message)
         path = self.state_dir / "daemon.log"
         try:
             with path.open("a") as stream:
-                stream.write(time.strftime("%Y-%m-%dT%H:%M:%SZ ") + message[:500] + "\n")
+                stream.write(datetime.now(timezone.utc).isoformat() + " " + message[:500] + "\n")
         except OSError:
             return
 
@@ -1243,10 +1272,12 @@ class CoordinatorService(TaskMessages):
             "endpoint": endpoint or None,
             "env": dict(role.get("env") or {}),
             "error": job.get("error"),
+            "error_details": job.get("error_details"),
             "lease_state": job.get("lease_state"),
             "quiet": (job.get("remote") or {}).get("quiet"),
             "descendants_drained": (job.get("remote") or {}).get("descendants_drained"),
             "status_observed_at": role.get("status_observed_at"),
+            "command_timings": ((job.get("remote") or {}).get("result") or {}).get("timings"),
         }
         if binding.get("endpoint"):
             target = self._target(row, binding, job)
@@ -1282,6 +1313,8 @@ class CoordinatorService(TaskMessages):
             payload["cancel_requested"] = True
         if row.get("error"):
             payload["error"] = str(row["error"])[:500]
+        if row.get("error_details"):
+            payload["error_details"] = row["error_details"]
             payload["error_ref"] = row.get("error_ref")
         if row.get("placement") and state == "waiting_for_runtime":
             payload.update({k: row["placement"].get(k) for k in ("reason", "provisioning_started") if k in (row["placement"] or {})})
@@ -1352,14 +1385,29 @@ class CoordinatorService(TaskMessages):
 
     def evidence(self, sessions_dir, user, execution_id, *, role=None, section="all", path=None):
         """Read this execution's existing local source/build receipts; never probe a mutable remote root."""
-        if section not in {"all", "sources", "preparation", "build"}:
-            raise ValueError("section must be all, sources, preparation or build")
+        if section not in {"all", "sources", "preparation", "build", "diagnostics"}:
+            raise ValueError("section must be all, sources, preparation, build or diagnostics")
         if path is not None and (not isinstance(path, str) or not path or len(path) > 1000):
             raise ValueError("path must be a nonempty artifact path substring of at most 1000 characters")
         store, row = self._owned_row(sessions_dir, user, execution_id)
         payload = self._reply(row, role=role)
         snapshot = row.get("spec", {}).get("source_snapshot") or {}
         evidence = {"basis": "recorded execution inputs and preparation receipts; no live revalidation"}
+        runs = [item["managed_job"] for item in row.get("roles", []) if item.get("managed_job") and (role is None or item.get("name") == role)]
+        try:
+            diagnostic_events = self.pool.diagnostic_events(user, runs)
+        except PermissionError:
+            raise
+        except Exception as exc:
+            diagnostic_events = {"operations": [], "unavailable": type(exc).__name__}
+        evidence["diagnostics"] = {"context": row.get("diagnostics_context") or {}, **diagnostic_events}
+        if section == "diagnostics":
+            from vaws_coordinator.diagnostics import execution_bundle
+            try:
+                evidence["support_bundle"] = execution_bundle(row, payload, diagnostic_events,
+                    self.state_dir / "results" / ("support-" + uuid.uuid4().hex + ".json"))
+            except Exception as exc:
+                evidence["support_bundle"] = {"unavailable": type(exc).__name__}
         if section in {"all", "sources"}:
             evidence["sources"] = {
                 "snapshot_id": snapshot.get("id"), "captured_at": snapshot.get("captured_at"),
@@ -1373,7 +1421,7 @@ class CoordinatorService(TaskMessages):
             evidence["preparation"] = {"stages": row.get("stage_history", []),
                 "current": row.get("role_progress") or row.get("progress"),
                 "phase_observed_at": row.get("phase_observed_at", {}),
-                "jobs": [{"name": name, **{key: job[key] for key in ("step", "state", "quiet", "job_id", "observed_at", "stage_timings", "elapsed_seconds") if key in job}}
+                "jobs": [{"name": name, **{key: job[key] for key in ("step", "state", "quiet", "job_id", "observed_at", "stage_timings", "elapsed_seconds", "timings", "command_timings", "transport_totals", "diagnostics_context") if key in job}}
                          for name, jobs in row.get("preparation_jobs", {}).items() if role is None or role == name
                          for job in jobs.values()]}
         if section in {"all", "preparation", "build"}:
@@ -1701,13 +1749,17 @@ class CoordinatorService(TaskMessages):
                 if lock.locked():
                     continue
                 thread = threading.Thread(
-                    target=self._tick_one, args=(directory, row, lock),
+                    target=wrap_context(self._tick_one), args=(directory, row, lock),
                     name=f"vaws-progress-{row['id'][:12]}", daemon=True,
                 )
                 thread.start()
             self._resume_finishing_sessions(directory, store)
 
     def _tick_one(self, directory, row, lock: threading.Lock) -> None:
+        with bind_context(row.get("diagnostics_context") or {}), detached_tool():
+            return self._tick_one_correlated(directory, row, lock)
+
+    def _tick_one_correlated(self, directory, row, lock: threading.Lock) -> None:
         if not lock.acquire(blocking=False):
             return
         try:
@@ -1753,9 +1805,10 @@ class CoordinatorService(TaskMessages):
                     raise PermissionError("coordinator IPC authentication failed")
                 reply = self.handle(request)
             except Exception as exc:
-                reply = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                reply = {"ok": False, "error": f"{type(exc).__name__}: {exc}", "error_details": error_details(exc)}
             conn.sendall((json.dumps(reply, default=str) + "\n").encode())
-        except (OSError, socket.timeout, json.JSONDecodeError):
+        except (OSError, socket.timeout, json.JSONDecodeError) as exc:
+            get_recorder("vaws-coordinator").event("WARNING", "ipc.response_unavailable", error_type=type(exc).__name__)
             return
         finally:
             try:
@@ -1770,6 +1823,7 @@ class CoordinatorClient:
         self.timeout = timeout
 
     def call(self, op: str, **payload) -> Any:
+        payload["diagnostics_context"] = current_context()
         path = socket_path(self.state_dir)
         if not path.exists():
             raise RuntimeError(f"coordinator daemon is not running at {path}")
@@ -1787,8 +1841,10 @@ class CoordinatorClient:
             target = str(path)
         conn = socket.socket(socket.AF_INET if os.name == "nt" else socket.AF_UNIX, socket.SOCK_STREAM)
         conn.settimeout(max(self.timeout, payload.get("timeout_seconds", 0) + 10) if op == "wait" else self.timeout)
+        submission_state = "not_sent"
         try:
             conn.connect(target)
+            submission_state = "uncertain"
             conn.sendall((json.dumps({"op": op, **payload}) + "\n").encode())
             data = b""
             while b"\n" not in data:
@@ -1796,21 +1852,33 @@ class CoordinatorClient:
                 if not chunk:
                     break
                 data += chunk
-        except OSError:
+        except OSError as exc:
             try:
                 conn.close()
             except OSError:
                 pass
-            raise
+            raise RemoteExecutionError("coordinator IPC response unavailable; do not resubmit an uncertain admission",
+                category="ipc_transport", submission_state=submission_state,
+                retryable=submission_state == "not_sent") from exc
         try:
-            reply = json.loads(data.decode() or "{}")
+            if not data or b"\n" not in data:
+                raise RemoteExecutionError("coordinator IPC reply was lost; original request outcome is uncertain",
+                    category="ipc_response", submission_state="uncertain")
+            try:
+                reply = json.loads(data.decode())
+            except (ValueError, UnicodeError) as exc:
+                raise RemoteExecutionError("coordinator IPC reply was invalid; original request outcome is uncertain",
+                    category="ipc_protocol", submission_state="uncertain") from exc
         finally:
             try:
                 conn.close()
             except OSError:
                 pass
         if not reply.get("ok"):
-            raise RuntimeError(reply.get("error") or "coordinator request failed")
+            detail = reply.get("error_details") or {}
+            raise RemoteExecutionError(reply.get("error") or "coordinator request failed",
+                                       category=detail.get("category", "coordinator"),
+                                       submission_state=detail.get("submission_state"), retryable=detail.get("retryable", False))
         return reply.get("value")
 
     def admit(self, sessions_dir, user, session_id, spec, restart=False):

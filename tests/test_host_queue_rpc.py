@@ -31,10 +31,13 @@ def test_default_backend_executes_fixed_host_code_with_separate_payloads(tmp_pat
     state_dir = str(tmp_path / "authority")
     status = backend.host({"host_endpoint": HOST}, {"action": "status", "no_probe": True, "state_dir": state_dir})
     epoch = status["coordination_epoch"]
+    assert status["diagnostics"]["elapsed_ms"] >= 0
+    assert len(status["diagnostics"]["clock_domain"]) == 32
     common = {"state_dir": state_dir, "coordination_epoch": epoch, "task_id": "cpu-task"}
     submitted = backend.host({"host_endpoint": HOST},
                              {**common, "action": "submit", "agent_id": "owner", "npu_count": 0})
     assert submitted["status"] == "queued"
+    assert submitted["diagnostics"]["phases"]["state_lock_wait_ms"] >= 0
     granted = backend.host({"host_endpoint": HOST}, {**common, "action": "acquire"})
     assert granted["status"] == "granted"
     # Execute the unchanged authority's fencing check in its real SQLite state.

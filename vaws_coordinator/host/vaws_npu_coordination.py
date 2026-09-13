@@ -17,6 +17,7 @@ or ``request["state_dir"]``) and is expected to disappear after a host or
 from __future__ import annotations
 
 import contextlib
+from contextvars import ContextVar
 import json
 import os
 import re
@@ -29,6 +30,14 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 SCHEMA_VERSION = 6
+_DIAGNOSTIC_PHASES = ContextVar("host_diagnostic_phases", default=None)
+_DIAGNOSTIC_PROCESS = uuid.uuid4().hex
+
+
+def _diagnostic_elapsed(name, started):
+    phases = _DIAGNOSTIC_PHASES.get()
+    if phases is not None:
+        phases[name] = phases.get(name, 0.0) + (time.monotonic() - started) * 1000
 DEFAULT_STATE_DIR = "/tmp/vaws-npu-coordinator/v1"
 HOST_STATE_DIR_ENV = "VAWS_NPU_COORDINATOR_STATE_DIR"
 DEFAULT_CONTAINER_SSH_PORT_RANGE = "46000:46999"
@@ -749,9 +758,11 @@ class NpuCoordinator:
 
     @contextlib.contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
+        started = time.monotonic()
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            _diagnostic_elapsed("state_lock_wait_ms", started)
             if self.expected_epoch is not None:
                 epoch = connection.execute("SELECT value FROM meta WHERE key='coordination_epoch'").fetchone()
                 if epoch is None or epoch["value"] != self.expected_epoch:
@@ -2075,7 +2086,32 @@ def _confirmed_free_probe(
     return latest
 
 
-def handle_request(
+def handle_request(request, *, probe=probe_npu_occupancy, device_probe=probe_npu_device,
+                   clock=time.time, listening_ports=probe_listening_ports):
+    """Self-contained host timing; no diagnostic package or remote log install."""
+    phases = {}
+    token = _DIAGNOSTIC_PHASES.set(phases)
+    started = time.monotonic()
+    def timed(name, function):
+        def call(*args, **kwargs):
+            before = time.monotonic()
+            try:
+                return function(*args, **kwargs)
+            finally:
+                _diagnostic_elapsed(name, before)
+        return call
+    try:
+        result = _handle_request(request, probe=timed("occupancy_probe_ms", probe),
+            device_probe=timed("device_probe_ms", device_probe), clock=clock,
+            listening_ports=timed("ports_probe_ms", listening_ports))
+        return {**result, "diagnostics": {"clock_domain": _DIAGNOSTIC_PROCESS,
+                "elapsed_ms": round((time.monotonic() - started) * 1000, 3),
+                "phases": {name: round(value, 3) for name, value in phases.items()}}}
+    finally:
+        _DIAGNOSTIC_PHASES.reset(token)
+
+
+def _handle_request(
     request: dict[str, Any],
     *,
     probe: Callable[[], dict[str, Any]] = probe_npu_occupancy,

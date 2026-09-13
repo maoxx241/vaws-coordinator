@@ -513,3 +513,49 @@ before preparing or authorizing the business command. A failed verification reta
 its error and drains the owned job before returning resources. Unknown process or
 host state keeps cleanup pending. Standalone `RuntimePool.request_run` also retains
 its remote verification before queueing.
+
+
+## Diagnostics
+
+Tool replies include `diagnostics` with an operation ID, trace ID, actual UTC
+start/end, monotonic duration, bounded phase summaries and a local `record_ref`.
+The operation ID exists before work starts. A run admission's duration describes
+that call; its asynchronous execution and later wait have separate lifetimes.
+Native MCP metadata propagates correlation automatically. Diagnostic IDs never
+grant task or endpoint authority and are excluded from launch-content identity.
+
+`VAWS_LOG_LEVEL=INFO` is the default. `DEBUG` adds RPC, lock and transport phase
+detail; `WARN`/`WARNING` retains warnings and errors. `VAWS_DIAGNOSTICS_ROOT`
+selects a private local log root. The shared diagnostics package rotates bounded
+per-process JSONL files and records package versions. Commands, file contents,
+environment values and credentials are not logging arguments. Business output
+remains in existing job logs and tool output, separate from implementation logs.
+MCP reserves its protocol descriptors: Python and native stdout writes go to
+stderr, and child processes cannot inherit protocol stdin accidentally.
+
+`error_details` preserves category, retryability and submission certainty.
+`not_sent` / `not_executed` indicate a known pre-execution boundary;
+`uncertain` requires observing the existing job/execution reference, without
+resubmission. `acknowledged` means the remote request was accepted, not that its
+business succeeded. Only an explicit `caller` category denotes known caller
+input error; a generic validation or permission exception is not that judgment.
+Cancellation/observation timeout does not fabricate quiet or resource release.
+Logging/export disk errors do not change business results or ownership; failures
+to persist authoritative execution state still fail.
+
+For a local issue attachment, the shared `vaws-diagnostics bundle` command makes
+an offline, bounded public projection from diagnostic events. Use the returned
+operation ID. It excludes raw commands, paths, endpoints and business logs, and
+reports missing or truncated evidence. It never replays work or uploads an issue
+by itself. Monotonic clocks are process-local: do not subtract remote/local UTC
+stamps or sum overlapping RPC, command and parallel-role phase durations.
+
+For an owned execution, `python -m vaws_coordinator.vaws execution
+--execution-id ID --action evidence --section diagnostics` returns its retained
+pool operations, stage timing and a redacted `support_bundle`. This path reads
+only the selected execution's local records, never global host status, housekeeping,
+other tasks' events or a remote directory. Source/preparation/build evidence
+remains available through the existing evidence sections. Preparation preserves
+launch/exchange costs; completed command receipts expose spawn, shell and
+process-family drain timing. Historical records without clock/correlation data
+report a gap instead of inventing an elapsed time.

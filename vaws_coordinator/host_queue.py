@@ -9,6 +9,7 @@ executed on the host. ``VAWS_HOST_QUEUE_MODULE`` overrides the bundled file.
 """
 
 from __future__ import annotations
+from remote_dev.observability import observed_operation
 
 import importlib.util
 import json
@@ -150,6 +151,7 @@ class HostQueue:
             f"{self.source()}\n{RUNNER}\n{SOURCE_DELIMITER}\n"
         )
 
+    @observed_operation(lambda self, host_endpoint, request: "host." + str(request.get("action", "unknown")), component="vaws-coordinator", level="DEBUG")
     def request(self, host_endpoint: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
         target = {**host_endpoint, "root": "/", "cwd": "/"}
         # Resolve the configured authority before sending anything. Requests
@@ -172,6 +174,13 @@ class HostQueue:
             ) from exc
         if not isinstance(payload, dict):
             raise RuntimeError("host coordination returned a non-object response")
+        if isinstance(payload.get("diagnostics"), dict):
+            from vaws_diagnostics import get_recorder
+            get_recorder("vaws-coordinator").event("DEBUG", "host.completed", **payload["diagnostics"])
         if payload.get("status") in UNRESOLVED or (payload.get("status") == "cancelled" and "task" not in payload):
-            raise RuntimeError(_reservation_failure(payload) or payload.get("error", "host state unknown"))
+            from remote_dev.core.errors import RemoteExecutionError
+            details = payload.get("error_details") or {}
+            raise RemoteExecutionError(_reservation_failure(payload) or payload.get("error", "host state unknown"),
+                category=details.get("category", "host_state"), submission_state=details.get("submission_state"),
+                retryable=details.get("retryable", False))
         return payload

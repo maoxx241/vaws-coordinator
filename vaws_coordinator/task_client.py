@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from remote_dev.observability import observed_tool
+from vaws_diagnostics import get_recorder
+
 import getpass
 import hashlib
 from pathlib import Path
@@ -116,6 +119,7 @@ class TaskClient:
         owner = self.coordinator
         return owner.pool if hasattr(owner, "pool") else self._pool
 
+    @observed_tool("vaws.session", component="vaws-coordinator")
     def status(self):
         context = self.store.context(self.context["attachment"]["id"])
         with self.store.transaction() as db:
@@ -139,6 +143,7 @@ class TaskClient:
         except Exception as exc:
             return {**value, "notification_status": {"state": "unavailable", "error": str(exc)[:300]}}
 
+    @observed_tool("vaws.message", component="vaws-coordinator")
     def message(self, recipient, text):
         """Send text to an existing coordination or reply reference.
 
@@ -151,10 +156,12 @@ class TaskClient:
     def reply(self, reply_reference, text):
         return self.message(reply_reference, text)
 
+    @observed_tool("vaws.session", component="vaws-coordinator")
     def sources(self, sources):
         self.context = self.store.bind_sources(self.context, sources)
         return self.context
 
+    @observed_tool("vaws.run", component="vaws-coordinator")
     def run(self, command=None, *, script_file=None, sources=None, env=None, environment=None, resources=None, topology=None,
             timeout_seconds=1800, service=None, restart=False, preflight=None,
             wait_until=None, wait_timeout_seconds=30):
@@ -208,7 +215,8 @@ class TaskClient:
             if defaults["origin"] == "unknown":
                 raise ValueError(defaults["reason"])
             sources = {name: source["path"] for name, source in defaults["sources"].items()}
-        source_snapshot = capture_sources(sources, self.store.state_dir)
+        with get_recorder("vaws-coordinator").operation("sources.capture"):
+            source_snapshot = capture_sources(sources, self.store.state_dir)
         spec = {
             "command": command, "env": env, "environment": environment or {},
             "resources": resources, "topology": topology or {}, "roles": roles,
@@ -238,6 +246,7 @@ class TaskClient:
         if row.get("session_id") != self.context["session"]["id"]:
             raise ValueError("execution belongs to another VAWS task")
 
+    @observed_tool("vaws.execution", component="vaws-coordinator")
     def target(self, execution_id):
         self._require_execution_id(execution_id)
         reply = self.coordinator.advance(str(self.store.state_dir), self.user, execution_id, action="target")
@@ -262,6 +271,7 @@ class TaskClient:
         selected = live or sorted(rows, key=lambda row: (row.get("created_at", 0), row["id"]))[-1:]
         return selected[0]["id"] if selected else None
 
+    @observed_tool("vaws.execution", component="vaws-coordinator")
     def observe(self, execution_id=None, action="status", force=False, role=None, refresh=True, *, service=None,
                 until="released", timeout_seconds=30, section="all", path=None):
         """Read status/logs/target/evidence, wait for, or stop one owned execution.
@@ -274,6 +284,8 @@ class TaskClient:
         ``action="wait"`` uses ``until`` and ``timeout_seconds`` (0-600).
         ``action="evidence"`` reads existing local receipts, optionally using
         ``section`` (all/sources/preparation/build) and artifact ``path`` filter.
+        ``section="diagnostics"`` exports a redacted support attachment from
+        this execution's retained local events; its file reference is returned.
         """
         if action not in {"status", "tail", "stop", "target", "wait", "evidence"}:
             raise ValueError("unsupported execution action")
@@ -299,6 +311,7 @@ class TaskClient:
                                         **({"refresh": False} if action == "status" and not refresh else {}))
         return self._with_notifications(reply) if action == "status" else reply
 
+    @observed_tool("vaws.finish", component="vaws-coordinator")
     def finish(self, force=False):
         local = self.store.close_if_unmanaged(self.context["session"]["id"], user=self.user, force=force)
         if local is not None:
@@ -306,6 +319,7 @@ class TaskClient:
         return self.coordinator.finish(str(self.store.state_dir), self.user,
                                        self.context["session"]["id"], force=force)
 
+    @observed_tool("vaws.execution", component="vaws-coordinator")
     def wait(self, execution_id, *, until="running", timeout_seconds=30, role=None):
         """Wait on one owned execution; return the last facts on bounded timeout.
 

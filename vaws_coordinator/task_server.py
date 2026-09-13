@@ -19,6 +19,8 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, BinaryIO
+from vaws_diagnostics import get_recorder, wrap_context, bind_context
+from remote_dev.observability import protocol_streams, observed_tool
 
 from vaws_coordinator.host_queue import SCHEMA_VERSION
 from vaws_coordinator.agent_session import AgentSessions
@@ -87,6 +89,12 @@ def canonical_name(name: str) -> str:
 
 
 def call_tool(name: str, arguments: dict[str, Any] | None, metadata: dict | None = None) -> dict[str, Any]:
+    with bind_context((metadata or {}).get("vaws_diagnostics") or {}):
+        return _call_tool(name, arguments, metadata)
+
+
+@observed_tool(lambda name, arguments, metadata=None: canonical_name(name), component="vaws-coordinator")
+def _call_tool(name, arguments, metadata=None):
     canonical = canonical_name(name)
     if canonical not in TOOL_SCHEMAS:
         raise ProtocolError(-32602, f"unknown task tool: {name}")
@@ -159,7 +167,9 @@ def handle(message: dict[str, Any]) -> dict[str, Any] | None:
     except ProtocolError as exc:
         return _error(request_id, exc.code, str(exc))
     except Exception as exc:  # noqa: BLE001
-        return _error(request_id, -32000, str(exc), {"type": type(exc).__name__})
+        from remote_dev.core.errors import error_details
+        return _error(request_id, -32000, str(exc), {**error_details(exc),
+            **({"diagnostics": exc.diagnostics} if hasattr(exc, "diagnostics") else {})})
 
 
 def _result(request_id: Any, value: dict[str, Any]) -> dict[str, Any]:
@@ -266,7 +276,7 @@ def serve(reader: BinaryIO, writer: BinaryIO) -> int:
             name = canonical_name(raw_name) if isinstance(raw_name, str) else ""
             waiting = (name == "vaws.run" or (name == "vaws.execution" and isinstance(args, dict)
                                               and args.get("action") == "wait"))
-            (waits if waiting else controls).submit(respond, message)
+            (waits if waiting else controls).submit(wrap_context(respond), message)
     return 0
 
 
@@ -290,16 +300,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.describe:
         print(json.dumps(describe(), ensure_ascii=False, indent=2))
         return 0
-    writer = sys.stdout.buffer
-    sys.stdout = sys.stderr
     # Reserve the protocol pipe for this reader before any read or worker
     # starts. Children (including third-party Git/version helpers) must not
     # inherit RPC stdin: on Windows, their startup can block behind its read.
     # os.dup creates a non-inheritable descriptor; dup2 also updates Windows'
     # standard-input handle. Explicit subprocess input still uses its own pipe.
-    with os.fdopen(os.dup(sys.stdin.fileno()), "rb") as reader:
-        with open(os.devnull, "rb") as empty:
-            os.dup2(empty.fileno(), sys.stdin.fileno())
+    with protocol_streams() as (reader, writer):
         return serve(reader, writer)
 
 

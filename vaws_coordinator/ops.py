@@ -10,6 +10,8 @@ from __future__ import annotations
 import time
 
 from remote_dev.result import make_result
+from remote_dev.observability import observed_tool
+from remote_dev.core.errors import error_details, caller_error
 from remote_dev.runtime import process_identity, runtime_status
 from vaws_coordinator.presentation import present
 from vaws_coordinator.placement import ENVIRONMENT_KEYS
@@ -74,7 +76,8 @@ TOOL_SCHEMAS = {
     "vaws.execution": task_schema({"execution_id": {"type": "string"}, "service": {"type": "string", "description": "Task-scoped service name, mutually exclusive with execution_id"}, "action": {"type": "string", "enum": ["status", "wait", "evidence", "tail", "stop", "target"]}, "force": {"type": "boolean"}, "refresh": {"type": "boolean", "default": False, "description": "Refresh remote status instead of reusing the last snapshot for up to two seconds. Busy executions return cache age and refresh_deferred."}, "role": {"type": "string", "description": "Optional topology role name"},
         "until": {"type": "string", "enum": ["running", "released"], "default": "released"},
         "timeout_seconds": {"type": "number", "minimum": 0, "maximum": 600, "default": 30},
-        "section": {"type": "string", "enum": ["all", "sources", "preparation", "build"], "default": "all"},
+        "section": {"type": "string", "enum": ["all", "sources", "preparation", "build", "diagnostics"], "default": "all",
+                    "description": "diagnostics exports a bounded redacted attachment from this owned execution's local records and returns its file ref; no remote probe or global state scan"},
         "path": {"type": "string", "description": "Optional artifact path substring for retained profile hashes"}}),
     "vaws.finish": task_schema({"force": {"type": "boolean"}}),
     "vaws.message": task_schema({"recipient": {"type": "object", "description": "Use an existing coordination reference or reply_reference unchanged."},
@@ -90,16 +93,17 @@ TOOL_SCHEMAS["vaws.execution"]["oneOf"] = [
 ]
 
 
+@observed_tool(lambda name, args, **kwargs: name, component="vaws-coordinator")
 def vaws_call(name, args, *, allow_native_context=True):
     started = time.monotonic()
     target = {"kind": "vaws-task"}
     client = None
     try:
         if name not in TOOL_SCHEMAS:
-            raise ValueError("unknown VAWS operation")
+            raise caller_error("unknown VAWS operation")
         unknown = set(args) - set(TOOL_SCHEMAS[name]["properties"])
         if unknown:
-            raise ValueError("unsupported fields for " + name + ": " + ", ".join(sorted(unknown)))
+            raise caller_error("unsupported fields for " + name + ": " + ", ".join(sorted(unknown)))
         from vaws_coordinator.task_client import TaskClient
         client = TaskClient(args.get("context_file", ""), allow_native_context=allow_native_context)
         target["session_id"] = client.context["session"]["id"]
@@ -150,7 +154,8 @@ def vaws_call(name, args, *, allow_native_context=True):
     except Exception as exc:
         result = make_result(tool=name, target=target, outcome="blocked", status="unavailable",
                              summary=str(exc), duration_ms=int((time.monotonic() - started) * 1000),
-                             warnings=["Local file and shell tools remain available. No remote success is implied."])
+                             warnings=["Local file and shell tools remain available. No remote success is implied."],
+                             extra={"error_details": error_details(exc)})
     result["runtime"] = {"client": [runtime_status(item) for item in LOADED_RUNTIMES]}
     if client is not None:
         service = client._service

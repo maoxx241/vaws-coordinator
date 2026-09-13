@@ -11,8 +11,11 @@ import shlex
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import PurePosixPath
+from vaws_diagnostics import get_recorder, wrap_context, current_context, bind_context
 
 from vaws_coordinator.runtime_profile import digest
+from remote_dev.core.errors import error_details
+from remote_dev.observability import detached_tool
 from vaws_coordinator.launch_observation import ENV_NAME, launch_observation
 
 JOB_TERMINAL = {"succeeded", "failed", "timeout", "cancelled", "inconclusive"}
@@ -80,6 +83,7 @@ class ManagedExecution:
             if binding["state"] != "bound":
                 raise ValueError("cannot start a managed job on a returned runtime")
             job = {"id": key, "owner": owner, "binding_id": binding_id,
+                   "diagnostics_context": current_context(),
                    "session": binding["intent"]["session"], "request": request, "spec": specification,
                    "job_id": "vaws-" + key, "state": "pending", "last_poll": 0,
                    "cancel_requested": False, "force": False, "hold_go": bool(hold_go)}
@@ -131,6 +135,8 @@ class ManagedExecution:
                 binding = self.owned(db, "binding", job["binding_id"], job["owner"])
                 runtime = self.get(db, "runtime", binding["runtime_id"])
                 runs = [row for row in self.rows(db, "run") if row["id"] == key]
+            correlation = bind_context(job.get("diagnostics_context") or {})
+            correlation.__enter__()
             if job["state"] in JOB_TERMINAL:
                 return job
             try:
@@ -280,11 +286,13 @@ class ManagedExecution:
                 # mismatch, an unresolved execution on the binding) can never
                 # succeed on retry. Fail terminally instead of wedging the
                 # binding in an uncertain poll loop.
-                job.update(state="failed", error=str(exc)[:500])
+                job.update(state="failed", error=str(exc)[:500], error_details=error_details(exc))
             except Exception as exc:
-                job.update(state="uncertain", error=str(exc)[:500])
+                job.update(state="uncertain", error=str(exc)[:500], error_details=error_details(exc))
             return self._save_managed(job)
         finally:
+            if "correlation" in locals():
+                correlation.__exit__(None, None, None)
             lock.release()
 
     def watch_completion(self, key, on_complete, stopped):
@@ -308,7 +316,8 @@ class ManagedExecution:
                         runtime = self.get(db, 'runtime', binding['runtime_id'])
                     if job['state'] in JOB_TERMINAL or job['state'] != 'running':
                         return
-                    observed = self.backend.wait_job(runtime, job['job_id'], timeout_seconds=10)
+                    with bind_context(job.get("diagnostics_context") or {}):
+                        observed = self.backend.wait_job(runtime, job['job_id'], timeout_seconds=10)
                     if observed.get('quiet') is True and observed.get('state') not in {'absent', 'prepared', 'running'}:
                         completed = self.managed_advance(key, _completed_observation=observed)
                         on_complete(completed)
@@ -322,13 +331,18 @@ class ManagedExecution:
                         if stopped.wait(drain_delay):
                             return
                         drain_delay = min(1.0, drain_delay * 2)
-            except Exception:
+            except Exception as exc:
                 # Ordinary status/recovery remains authoritative after a lost
                 # wait reply. Never manufacture quiet or resend the command.
+                get_recorder("vaws-coordinator").event("WARNING", "completion.observation_failed",
+                    run_id=key, error_type=type(exc).__name__, category="observation_unavailable")
                 return
             finally:
                 lock.release()
-        threading.Thread(target=watch, name='vaws-completion-' + key[:12], daemon=True).start()
+        def detached_watch():
+            with detached_tool():
+                watch()
+        threading.Thread(target=wrap_context(detached_watch), name='vaws-completion-' + key[:12], daemon=True).start()
 
     def _refresh_managed_cancel(self, job):
         with self.transaction() as db:

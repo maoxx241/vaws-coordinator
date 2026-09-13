@@ -70,7 +70,8 @@ def test_short_preparation_returns_initial_output_and_exit_receipt_without_anoth
     assert output == [("stdout", "complete"), ("stderr", "warning")]
     assert control.call_count == 1 and control.call_args.args[2] == "launch"
     assert saved[-1]["quiet"] is True and saved[-1]["stdout_offset"] == 8
-    assert not ({"stdout", "stderr", "timings"} & saved[-1].keys())
+    assert not ({"stdout", "stderr"} & saved[-1].keys())
+    assert saved[-1]["timings"] == {"prepare_ms": 10}
 
 
 def test_quiet_launch_drains_remaining_output_from_initial_offsets(monkeypatch):

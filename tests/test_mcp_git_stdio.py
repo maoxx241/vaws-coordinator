@@ -26,6 +26,7 @@ def test_worker_binds_and_captures_sources_while_mcp_reader_waits(tmp_path):
     context = AgentSessions(state).attach("codex", "stdio-git", str(tmp_path))
     environment = {key: value for key, value in os.environ.items() if not key.startswith("VAWS_")}
     environment.update(VAWS_AGENT_SESSIONS_DIR=str(state),
+                       VAWS_DIAGNOSTICS_ROOT=str(tmp_path / "diagnostics"),
                        VAWS_COORDINATOR_STATE_DIR=str(tmp_path / "coordinator"))
     # Keep real TaskClient input capture, but never start a daemon or contact a
     # host. Reaching the admission boundary proves every local Git call returned.
