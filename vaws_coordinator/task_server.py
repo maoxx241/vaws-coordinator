@@ -14,7 +14,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, BinaryIO
 
 from vaws_coordinator.host_queue import SCHEMA_VERSION
@@ -175,15 +178,17 @@ class StdioTransport:
         self.reader = reader
         self.writer = writer
         self.framed: bool | None = None
+        self._write_lock = threading.Lock()
 
     def send(self, payload: dict[str, Any]) -> None:
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        if self.framed:
-            self.writer.write(f"Content-Length: {len(encoded)}\r\n\r\n".encode("ascii"))
-            self.writer.write(encoded)
-        else:
-            self.writer.write(encoded + b"\n")
-        self.writer.flush()
+        with self._write_lock:
+            if self.framed:
+                self.writer.write(f"Content-Length: {len(encoded)}\r\n\r\n".encode("ascii"))
+                self.writer.write(encoded)
+            else:
+                self.writer.write(encoded + b"\n")
+            self.writer.flush()
 
     def _read_exact(self, length: int) -> bytes:
         chunks = bytearray()
@@ -243,10 +248,25 @@ class StdioTransport:
 
 def serve(reader: BinaryIO, writer: BinaryIO) -> int:
     transport = StdioTransport(reader, writer)
-    for message in transport.messages():
+    def respond(message):
         response = handle(message)
         if response is not None:
             transport.send(response)
+    # Separate capacity keeps stop/status usable even when all wait workers
+    # are occupied. JSON-RPC responses are correlated by id, not arrival order.
+    with ThreadPoolExecutor(max_workers=8, thread_name_prefix="vaws-mcp-wait") as waits, \
+            ThreadPoolExecutor(max_workers=4, thread_name_prefix="vaws-mcp-control") as controls:
+        for message in transport.messages():
+            if message.get("method") != "tools/call":
+                respond(message)
+                continue
+            params = message.get("params") or {}
+            args = (params.get("arguments") or {}) if isinstance(params, dict) else {}
+            raw_name = params.get("name") if isinstance(params, dict) else None
+            name = canonical_name(raw_name) if isinstance(raw_name, str) else ""
+            waiting = (name == "vaws.run" or (name == "vaws.execution" and isinstance(args, dict)
+                                              and args.get("action") == "wait"))
+            (waits if waiting else controls).submit(respond, message)
     return 0
 
 
@@ -270,9 +290,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.describe:
         print(json.dumps(describe(), ensure_ascii=False, indent=2))
         return 0
-    reader, writer = sys.stdin.buffer, sys.stdout.buffer
+    writer = sys.stdout.buffer
     sys.stdout = sys.stderr
-    return serve(reader, writer)
+    # Reserve the protocol pipe for this reader before any read or worker
+    # starts. Children (including third-party Git/version helpers) must not
+    # inherit RPC stdin: on Windows, their startup can block behind its read.
+    # os.dup creates a non-inheritable descriptor; dup2 also updates Windows'
+    # standard-input handle. Explicit subprocess input still uses its own pipe.
+    with os.fdopen(os.dup(sys.stdin.fileno()), "rb") as reader:
+        with open(os.devnull, "rb") as empty:
+            os.dup2(empty.fileno(), sys.stdin.fileno())
+        return serve(reader, writer)
 
 
 if __name__ == "__main__":

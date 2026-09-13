@@ -66,17 +66,16 @@ def test_missing_or_conflicting_reference_is_rejected(clients):
 def test_release_wait_does_not_treat_terminal_but_leased_as_released(clients):
     store, (first, _), owner = clients
     eid = add(store, first, "one")
-    owner.advance.side_effect = None
-    owner.advance.return_value = {"execution_id": eid, "state": "cancelled", "resources_released": False}
+    owner.wait.return_value = {"execution_id": eid, "state": "cancelled", "resources_released": False, "wait_timed_out": True}
     assert first.wait(eid, until="released", timeout_seconds=0)["wait_timed_out"] is True
-    owner.advance.return_value["resources_released"] = True
+    owner.wait.return_value = {"execution_id": eid, "state": "cancelled", "resources_released": True}
     assert "wait_timed_out" not in first.wait(eid, until="released", timeout_seconds=0)
 
 
 def test_running_wait_returns_failure_without_waiting_or_relaunching(clients):
     store, (first, _), owner = clients
     eid = add(store, first, "one")
-    owner.advance.side_effect = None
-    owner.advance.return_value = {"execution_id": eid, "state": "failed"}
+    owner.wait.return_value = {"execution_id": eid, "state": "failed"}
     assert first.wait(eid)["state"] == "failed"
     owner.admit.assert_not_called()
+    owner.advance.assert_not_called()

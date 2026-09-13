@@ -144,18 +144,33 @@ def shared_base_key(preparation: dict, image_digest: str) -> str:
 def store_shared_native(root: Path, cache: Path) -> dict:
     """Automatically cache only the existing verified output bundle and metadata."""
     manifest = json.loads((root / '.vaws-runtime/ready-profile.json').read_text())
-    preparation = manifest['preparation']
-    key = shared_input_key(preparation, manifest['profile']['image_digest'])
+    manifest = _with_distribution_metadata(manifest)
+    bundle = publish(root, cache / 'bundles', manifest)
+    return _index_native_bundle(cache, manifest, bundle)
+
+
+def _store_captured_native(root: Path, cache: Path, manifest: dict, timings: dict) -> dict:
+    """Only the managed capture's current stack supplies this fresh manifest."""
+    manifest = _with_distribution_metadata(manifest)
+    bundle = _publish_captured_bundle(root, cache / 'bundles', manifest, timings=timings)
+    return _index_native_bundle(cache, manifest, bundle)
+
+
+def _with_distribution_metadata(manifest: dict) -> dict:
     metadata = {}
     for name in ('vllm', 'vllm-ascend'):
         distribution = importlib.metadata.distribution(name)
         metadata[name] = {'version': distribution.version, 'files': {
             filename: distribution.read_text(filename) for filename in
             ('METADATA', 'WHEEL', 'entry_points.txt', 'top_level.txt')}}
-    manifest = {**manifest, 'distributions': metadata}
-    bundle = publish(root, cache / 'bundles', manifest)
+    return {**manifest, 'distributions': metadata}
+
+
+def _index_native_bundle(cache: Path, manifest: dict, bundle: Path) -> dict:
     # publish already atomically verifies and installs the complete directory.
     # The small index does not register or expose any donor interpreter/runtime.
+    preparation = manifest['preparation']
+    key = shared_input_key(preparation, manifest['profile']['image_digest'])
     cache.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix='.index-', dir=cache)
     try:

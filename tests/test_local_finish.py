@@ -31,6 +31,19 @@ from vaws_coordinator.task_client import TaskClient
 store=AgentSessions(Path(sys.argv[1]) / "sessions")
 context=store.attach("codex", "fresh-local", sys.argv[1])
 client=TaskClient(context["context_file"], user="user")
+for kwargs in ({"command": " "}, {"command": " ", "wait_until": "released"}):
+    try:
+        client.run(**kwargs)
+    except ValueError as exc:
+        assert str(exc) == "command is required", exc
+    else:
+        raise AssertionError("empty command was accepted")
+try:
+    client.wait("invalid-id", until="released")
+except ValueError as exc:
+    assert str(exc) == "invalid local execution id", exc
+else:
+    raise AssertionError("invalid execution was accepted")
 reply=client.finish(force=True)
 assert reply == {"state":"finished", "executions":[], "worktrees_preserved":True}, reply
 assert client.finish() == reply

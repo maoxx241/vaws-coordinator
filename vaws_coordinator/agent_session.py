@@ -29,7 +29,7 @@ def git_common_directory(path: str | Path) -> Path:
     directory = Path(client_path(path)).expanduser().resolve(strict=True)
     result = subprocess.run(
         ["git", "-C", str(directory), "rev-parse", "--path-format=absolute", "--git-common-dir"],
-        capture_output=True, text=True, encoding="utf-8", timeout=5, check=True,
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", timeout=5, check=True,
     )
     return Path(client_path(result.stdout.strip())).resolve(strict=True)
 
@@ -44,20 +44,24 @@ def source_defaults(session: dict, attachment: dict) -> dict:
         return {"origin": "unknown", "sources": {},
                 "reason": "Saved source defaults have no provenance; set sources explicitly before submitting, "
                           "or pass sources on this run. No legacy mapping was assumed to follow the native cwd."}
+    if attachment.get("source_error"):
+        return {"origin": "unknown", "sources": {}, "reason": attachment["source_error"]}
     return {"origin": attachment.get("source_mode", "none"), "sources": attachment.get("sources", {})}
 
 
 def worktree_reference(path: str) -> dict:
     """Inspect an actual repository; never materialize a second source copy."""
+    # Git must not inherit the MCP input pipe while its transport reads it.
+    # On Windows that can block Git startup and even timeout cleanup.
     source = Path(client_path(path)).expanduser().resolve(strict=True)
     result = subprocess.run(
         ["git", "-C", str(source), "rev-parse", "--show-toplevel"],
-        capture_output=True, text=True, encoding="utf-8", timeout=5, check=True,
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", timeout=5, check=True,
     )
     root = Path(result.stdout.strip()).resolve()
     info = subprocess.run(
         ["git", "-C", str(root), "rev-parse", "--git-common-dir", "HEAD"],
-        capture_output=True, text=True, encoding="utf-8", timeout=5, check=True,
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", timeout=5, check=True,
     ).stdout.splitlines()
     return {"path": str(root), "git_common_dir": str((root / info[0]).resolve()), "head_at_bind": info[1]}
 
@@ -193,6 +197,7 @@ class AgentSessions:
                     # the previous mutable automatic source after that move.
                     old.pop("sources", None)
                     old.pop("source_mode", None)
+                    old.pop("source_error", None)
                 old.update(state="attached", resumed_at=now, cwd=actual_cwd)
                 self.put(db, "attachment", old)
         return self._publish(key)
@@ -256,17 +261,37 @@ class AgentSessions:
             self.put(db, "session", session)
         return self.context(context["attachment"]["id"])
 
-    def bind_native_sources(self, context: dict) -> dict:
-        """Bind only this attachment's actual cwd, without changing task defaults."""
+    def bind_native_sources(self, context: dict, *, sources: dict[str, str] | None = None) -> dict:
+        """Bind consumer-selected roots or native cwd, without changing task defaults."""
         attachment = self.context(context["attachment"]["id"])["attachment"]
-        reference = worktree_reference(attachment["cwd"])
-        common = Path(reference["git_common_dir"])
-        name = common.parent.name if common.name == ".git" else common.stem
+        if sources is None:
+            reference = worktree_reference(attachment["cwd"])
+            common = Path(reference["git_common_dir"])
+            name = common.parent.name if common.name == ".git" else common.stem
+            references, source_mode = {name: reference}, "native-cwd"
+        else:
+            references = {}
+            try:
+                for name, path in sources.items():
+                    if not isinstance(name, str) or not name or name in {".", ".."} or "/" in name or "\\" in name:
+                        raise ValueError("source names must be single repository names")
+                    references[name] = worktree_reference(path)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                with self.transaction() as db:
+                    current = self.get(db, "attachment", attachment["id"])
+                    if current["cwd"] == attachment["cwd"]:
+                        current.update(sources={}, source_mode="unknown", source_error=
+                                       "Prepared native source roots are unavailable; restore the selected repositories "
+                                       "or pass sources explicitly. No empty source set was assumed.")
+                        self.put(db, "attachment", current)
+                raise
+            source_mode = "native-prepared"
         with self.transaction() as db:
             current = self.get(db, "attachment", attachment["id"])
             if current["cwd"] != attachment["cwd"]:
                 raise ValueError("native working directory changed while binding its source")
-            current.update(sources={name: reference}, source_mode="native-cwd")
+            current.update(sources=references, source_mode=source_mode)
+            current.pop("source_error", None)
             self.put(db, "attachment", current)
         return self.context(attachment["id"])
 

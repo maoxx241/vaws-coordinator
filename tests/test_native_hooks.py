@@ -248,3 +248,112 @@ def test_unrelated_grok_dispatcher_never_opens_registry(monkeypatch):
                         Mock(side_effect=AssertionError("ordinary nested call must not open registry")))
     assert handle("grok", {"hookEventName": "pre_tool_use", "toolName": "use_tool",
                            "toolInput": {"tool_name": "other_provider__remote_read", "tool_input": {"path": "/work/code.py"}}}) == {}
+
+
+@pytest.mark.parametrize("client", ["claude", "codex", "cursor", "grok", "kimi"])
+def test_prepared_roots_bind_on_native_start_resume_and_child_without_overriding_explicit_empty(tmp_path, client):
+    root = repo(tmp_path / "workspace")
+    child = repo(root / "business")
+    sources = {"workspace": str(root), "business": str(child)}
+    store = AgentSessions(tmp_path / "sessions")
+    payload = {"hook_event_name": "SessionStart", "session_id": "native", "cwd": str(root)}
+    handle(client, payload, store, sources=sources)
+    context = store.native_context(client, "native")
+    assert context["source_defaults"]["origin"] == "native-prepared"
+    assert {name: row["path"] for name, row in context["source_defaults"]["sources"].items()} == sources
+    handle(client, {**payload, "hook_event_name": "SubagentStart", "agent_id": "child"}, store, sources=sources)
+    attached = store.native_context(client, "native", "child")
+    assert attached["session"]["id"] == context["session"]["id"]
+    assert attached["source_defaults"]["sources"] == context["source_defaults"]["sources"]
+    store.bind_sources(context, {})
+    handle(client, {**payload, "source": "resume"}, store, sources=sources)
+    assert store.native_context(client, "native")["source_defaults"] == {"origin": "explicit", "sources": {}}
+
+
+def test_prepared_source_map_is_replaced_after_native_cwd_change_and_not_rebound_per_tool(tmp_path, monkeypatch):
+    first, second = repo(tmp_path / "first"), repo(tmp_path / "second")
+    store = AgentSessions(tmp_path / "sessions")
+    payload = {"hook_event_name": "SessionStart", "session_id": "native", "cwd": str(first)}
+    handle("claude", payload, store, sources={"first": str(first)})
+    handle("claude", {**payload, "hook_event_name": "UserPromptSubmit", "cwd": str(second)},
+           store, sources={"second": str(second)})
+    current = store.native_context("claude", "native")
+    assert set(current["source_defaults"]["sources"]) == {"second"}
+    monkeypatch.setattr(store, "bind_native_sources", Mock(side_effect=AssertionError("repeated source binding")))
+    tool = {**payload, "hook_event_name": "PreToolUse", "cwd": str(second),
+            "tool_name": "vaws_run", "tool_input": {}}
+    assert handle("claude", tool, store, sources={"second": str(second)})
+
+
+def test_selected_roots_extend_hook_scope_but_unselected_nested_clone_does_not(tmp_path):
+    from vaws_coordinator.hooks.vaws_session import in_project_scope
+    project, bundle = repo(tmp_path / "project"), repo(tmp_path / "bundle")
+    selected, unrelated = repo(bundle / "selected"), repo(bundle / "unrelated")
+    roots = {"workspace": str(bundle), "business": str(selected)}
+    assert in_project_scope(selected, project, sources=roots)
+    assert not in_project_scope(unrelated, project, sources=roots)
+
+
+def test_explicit_empty_native_map_stays_empty(tmp_path):
+    root = repo(tmp_path / "project")
+    store = AgentSessions(tmp_path / "sessions")
+    context = store.attach("codex", "native", str(root))
+    context = store.bind_native_sources(context, sources={})
+    assert context["source_defaults"] == {"origin": "native-prepared", "sources": {}}
+
+
+def test_native_prepared_roots_capture_ignored_child_edits(tmp_path):
+    from test_execution_inputs import git
+    from vaws_coordinator.execution_sources import capture_sources
+    root = repo(tmp_path / "workspace")
+    (root / ".gitignore").write_text("/business/\n")
+    git(root, "add", ".gitignore")
+    git(root, "commit", "-m", "ignore independent source")
+    child = repo(root / "business")
+    store = AgentSessions(tmp_path / "sessions")
+    handle("codex", {"hook_event_name": "SessionStart", "session_id": "native", "cwd": str(root)},
+           store, sources={"workspace": str(root), "business": str(child)})
+    context = store.native_context("codex", "native")
+    defaults = {name: row["path"] for name, row in context["source_defaults"]["sources"].items()}
+    before = capture_sources(defaults, tmp_path / "snapshots")
+    (child / "value.txt").write_text("dirty child")
+    assert git(root, "status", "--porcelain") == ""
+    after = capture_sources(defaults, tmp_path / "snapshots")
+    assert before["id"] != after["id"]
+    changed = next(record for record in after["records"] if record["relpath"] == "business")
+    assert git(child, "show", changed["commit"] + ":value.txt") == "dirty child"
+
+
+def test_missing_prepared_child_never_becomes_implicit_source_free_execution(tmp_path):
+    source = repo(tmp_path / "workspace")
+    store = AgentSessions(tmp_path / "sessions")
+    event = {"hook_event_name": "SessionStart", "session_id": "native", "cwd": str(source)}
+    roots = {"workspace": str(source), "business": str(source / "missing")}
+    handle("codex", event, store, sources=roots)
+    context = store.native_context("codex", "native")
+    assert context["source_defaults"]["origin"] == "unknown"
+    assert "No empty source set" in context["source_defaults"]["reason"]
+    store.bind_sources(context, {})
+    assert store.native_context("codex", "native")["source_defaults"] == {"origin": "explicit", "sources": {}}
+    # Recovered automatic references no longer retain a stale binding error.
+    repo(source / "missing")
+    restored = store.bind_native_sources(context, sources=roots)
+    assert "source_error" not in restored["attachment"]
+
+
+def test_prepared_roots_keep_global_kimi_silent_outside_git_project(tmp_path, monkeypatch, capsys):
+    from vaws_coordinator.hooks.vaws_session import in_project_scope
+    project = repo(tmp_path / "project")
+    outside = tmp_path / "non-git"
+    outside.mkdir()
+    sources = {"workspace": str(project)}
+    assert not in_project_scope(outside, project, sources=sources)
+    monkeypatch.setattr("sys.argv", ["hook", "--client", "kimi", "--project", str(project)])
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"hook_event_name": "UserPromptSubmit",
+                        "session_id": "unrelated", "cwd": str(outside)})))
+    monkeypatch.setattr("vaws_coordinator.hooks.vaws_session.AgentSessions",
+                        Mock(side_effect=AssertionError("outside scope must not open registry")))
+    capsys.readouterr()
+    assert main(sources=sources) == 0
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "" and captured.err == ""

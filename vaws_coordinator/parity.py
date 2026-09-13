@@ -117,12 +117,32 @@ def materialize_command(
     return command
 
 
+def _write_materialized_build_source(root, data):
+    """Publish fixed SCM/build metadata only after complete source materialization."""
+    import json, os, tempfile, time
+    from pathlib import Path
+    started = time.monotonic()
+    directory = Path(root) / '.vaws-runtime'
+    if directory.is_symlink():
+        raise ValueError('build metadata escaped owned runtime')
+    directory.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix='.build-source-', dir=directory)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            json.dump(data, stream, sort_keys=True)
+        os.replace(temporary, directory / 'build-source.json')
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return time.monotonic() - started
+
+
 def materialize_fixed_sources(*, workspace_id: str, endpoint: dict, source_snapshot: dict,
                               log_path=None, process=None, on_progress=None,
                               container_cache_root: str | None = None,
                               host_endpoint: dict | None = None,
                               shared_cache_root: str | None = None,
-                              native_publication=None) -> dict:
+                              native_publication=None, build_source=None) -> dict:
     """Materialize admitted inputs directly, without the public sync lifecycle.
 
     One completed remote operation pins available objects, checks out the exact
@@ -180,6 +200,11 @@ def materialize_fixed_sources(*, workspace_id: str, endpoint: dict, source_snaps
     def command():
         program = (inspect.getsource(copy_fixed_objects) + '\n' + inspect.getsource(_materialize_fixed)
                    + '\nimport json\nresult = _materialize_fixed(' + repr(request) + ')\n')
+        if build_source is not None:
+            program += (inspect.getsource(_write_materialized_build_source)
+                        + "\nif result.get('status') == 'materialized':\n"
+                        + "    result['build_source_seconds'] = _write_materialized_build_source("
+                        + repr(root) + ', ' + repr(build_source) + ')\n')
         if native_publication is not None:
             return native_publication.wrap_program(program)
         return ("python3 - <<'VAWS_FIXED_SOURCES'\n" + program
@@ -345,7 +370,7 @@ def _clean_head_snapshot_base(record):
                 raise TimeoutError('optional clean snapshot hint exceeded its budget')
             return subprocess.run(
                 ['git', '--no-replace-objects', '-C', record.source_path, *args],
-                input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                input=data if data is not None else b'', stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 check=True, timeout=remaining, env=env,
             ).stdout
 

@@ -7,6 +7,7 @@ a partial group.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 SUPPORTED_RECIPES = {"rc", "main", "stable", "local-latest"}
@@ -15,6 +16,15 @@ ENVIRONMENT_KEYS = {"recipe", "image", "python_abi", "cann", "soc", "machine_typ
 RESOURCE_KEYS = {"devices", "npu_count", "service_port", "allow_external_busy"}
 TOPOLOGY_KEYS = {"host", "roles", "distinct_hosts"}
 ROLE_KEYS = {"name", "command", "preflight", "devices", "npu_count", "service_port", "allow_external_busy", "host", "env"}
+
+
+def validate_wait(until, timeout_seconds):
+    """Validate an observation request without importing the service runtime."""
+    if until not in {"running", "released"}:
+        raise ValueError("until must be running or released")
+    if (isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float))
+            or not math.isfinite(timeout_seconds) or not 0 <= timeout_seconds <= 600):
+        raise ValueError("wait timeout_seconds must be finite and between 0 and 600")
 
 
 def provisionable_recipe(recipe: str) -> bool:

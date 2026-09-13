@@ -24,13 +24,26 @@ run = client.run(
     sources={"vllm": "/local/vllm", "vllm-ascend": "/local/vllm-ascend"},
     resources={"devices": [0]},
     topology={"host": "npu-host"},
+    wait_until="released", wait_timeout_seconds=180,
 )
 execution_id = run["execution_id"]
-status = client.wait(execution_id, until="released", timeout_seconds=30)
-print(status["state"], status["resources_released"])
-log = client.observe(execution_id, action="tail")
-print(log.get("tail", ""))
+print(run["state"], run["resources_released"], run.get("stdout", ""))
 ```
+
+A local shell file can be submitted directly, without a Python runner:
+
+```bash
+vaws run --script-file business.sh --source app=/local/app --wait released --wait-timeout-seconds 180
+vaws execution --execution-id EXECUTION_ID --wait released --wait-timeout-seconds 180
+vaws execution --execution-id EXECUTION_ID --action evidence --section build --path kernel_name
+```
+
+`script_file` and `command` are mutually exclusive. The UTF-8 shell file is
+read once (up to 1 MiB); a BOM is removed and CRLF becomes LF for Bash. Original
+bytes/digest and the submitted command digest are recorded; the local filename does not
+change service identity. MCP accepts the same `script_file`, `wait_until` and
+`wait_timeout_seconds` run arguments. For an existing execution, MCP/Python use
+`action="wait"`, `until="released"` and `timeout_seconds=180`.
 
 Replace the paths and host with your task's inputs. Use the native attachment's
 supplied `context_file`, or `TaskClient()` to resolve `VAWS_CONTEXT_FILE` / the
@@ -43,11 +56,19 @@ use `npu_count` for available devices or `devices` with `topology.host` for
 specific physical devices. Explicit sharing of one physical NPU adds
 `allow_external_busy=True` to resources; other managed leases still conflict.
 
-`run` returns after admission. A released result confirms termination and
+`run` returns after admission unless `wait_until` is supplied. A released result confirms termination and
 resource release; business success also requires `state == "succeeded"`.
 If a bounded wait returns `wait_timed_out=True`, inspect its facts and wait on
 the same id again as needed; that timeout does not stop or resubmit the work.
-Tail replies include `tail` and separate `stdout` / `stderr`. For progress use
+Wait budgets are 0–600 seconds and are separate from the command's execution
+timeout. The owner handles waiting; no Agent status loop is required. Terminal
+wait returns `stdout` / `stderr` / `tail`, fetched once and cached on the execution.
+A slow log read can return `logs_pending=True`; a failed read returns `tail_error`.
+Neither changes the business state or release facts. Waiting again on the same
+reference reuses the collection. Explicit tail remains available for a fresh log read.
+If observation fails after admission, `wait_error` retains the admitted execution
+reference; continue observing that reference instead of submitting again.
+For progress use
 `observe(execution_id, refresh=False)`; to stop it use `action="stop"` and wait
 for release. `finish()` closes the entire task and stops its owned executions;
 completed runs release their resources without a per-run finish call.
@@ -89,11 +110,19 @@ An ambiguous live service requires an execution reference. Lookup never joins
 another task or allocates resources.
 
 Library workflows can use `client.wait(execution_id, until="running")` or
-`until="released"`, with a bounded `timeout_seconds`. A timeout returns the
+`until="released"`, with `timeout_seconds` between 0 and 600. A timeout returns the
 last observation with `wait_timed_out: true`; a release wait requires confirmed
 termination and resource release. Changing bound business worktree paths
 changes defaults for future submissions. It does not affect active executions
 or require their bindings to be returned.
+
+`observe(execution_id, action="evidence")` reads retained source snapshots,
+preparation stages and native profile receipts. Select `section="sources"`,
+`"preparation"` or `"build"` when useful; `path` filters artifact path substrings.
+The coordinator decodes existing compressed receipts and returns readable facts,
+hashes and original references. Missing or mismatching receipts are explicit.
+This is optional diagnosis of recorded execution facts, not a new business
+validation step or a live check of mutable remote files.
 
 `client.run(command, sources={"app": "/actual/worktree"})` captures fixed Git
 content and SCM provenance before admission. Omitted `sources` uses explicit
@@ -155,8 +184,12 @@ roles are sampled concurrently with at most four workers. The top-level `observe
 response-generation time, not proof of a new remote query.
 
 `TaskClient.observe()` preserves its fresh-by-default library behavior; pass
-`refresh=False` to read the nonblocking status cache. `TaskClient.wait()` uses
-this path so slow remote probes cannot overrun its observation timeout. Tail, target, stop, resource
+`refresh=False` to read the nonblocking status cache. `TaskClient.wait()` uses one
+owner RPC with condition notifications, with no execution lock held while waiting.
+MCP wait and control requests use separate worker pools, keeping stop and ping
+responsive. Remote completion detection still follows the existing two-second
+supervision cadence plus remote IO; notifications remove an additional client
+polling interval, not that remote sampling delay. Tail, target, stop, resource
 allocation and background progression retain their existing behavior. Cached
 observations neither allocate resources nor establish new ownership. A busy
 execution returns its stored observation immediately and explicitly marks a
