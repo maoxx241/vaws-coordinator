@@ -1,5 +1,7 @@
 """Fresh discovery combines exact task and container facts without housekeeping."""
 import json
+import time
+import uuid
 
 import pytest
 
@@ -45,6 +47,7 @@ def test_compact_verification_reuses_the_same_round_container_fact(launch, monke
 
 
 def test_managed_context_is_used_once_and_lifecycle_spans_are_bounded(case):
+    started = time.monotonic_ns()
     binding = case.bind("alice", case.root / "a")
     contexts, verifications = [], []
 
@@ -63,7 +66,17 @@ def test_managed_context_is_used_once_and_lifecycle_spans_are_bounded(case):
     events = [row for row in case.pool.events("alice")["events"] if row["kind"] == "run-operation"]
     assert {row["operation"] for row in events} == {"startup-context", "verify-preflight", "admission", "preflight", "prepare", "activate", "go"}
     assert all(row["elapsed_seconds"] >= 0 for row in events)
-    assert all(set(row) <= {"cursor", "kind", "at", "run", "operation", "elapsed_seconds"} for row in events)
+    finished = time.monotonic_ns()
+    assert all(set(row) <= {"cursor", "kind", "at", "run", "operation", "elapsed_seconds",
+                           "monotonic_ns", "process_instance_id", "diagnostics_context"} for row in events)
+    assert len({row["process_instance_id"] for row in events}) == 1
+    for row in events:
+        assert uuid.UUID(row["process_instance_id"]).version == 4
+        assert type(row["monotonic_ns"]) is int and started <= row["monotonic_ns"] <= finished
+        assert set(row["diagnostics_context"]) <= {"trace_id", "operation_id", "phase_id"}
+        assert all(len(value) == 32 and int(value, 16) >= 0 for value in row["diagnostics_context"].values())
+        assert len(json.dumps(row).encode()) < 2048
+    assert [row["monotonic_ns"] for row in events] == sorted(row["monotonic_ns"] for row in events)
     case.pool.managed_advance(job["id"])
     assert len([row for row in case.pool.events("alice")["events"] if row["kind"] == "run-operation"]) == len(events)
 

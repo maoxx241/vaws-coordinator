@@ -18,12 +18,13 @@ def task(tmp_path, **kwargs):
     return store, context, TaskClient(context["context_file"], user="user", **kwargs)
 
 
-def test_empty_finish_has_no_service_or_remote_dev_import_in_fresh_process(tmp_path):
+def test_empty_finish_has_no_service_or_remote_transport_import_in_fresh_process(tmp_path):
     script = '''import importlib.abc,json,sys
 from pathlib import Path
 class BlockManagedImports(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
-        if fullname == "vaws_coordinator.service" or fullname == "remote_dev" or fullname.startswith("remote_dev."):
+        pure_diagnostics = {"remote_dev", "remote_dev.observability", "remote_dev.core", "remote_dev.core.errors"}
+        if fullname == "vaws_coordinator.service" or (fullname.startswith("remote_dev.") and fullname not in pure_diagnostics):
             raise AssertionError("unmanaged finish imported " + fullname)
 sys.meta_path.insert(0, BlockManagedImports())
 from vaws_coordinator.agent_session import AgentSessions
@@ -45,15 +46,25 @@ except ValueError as exc:
 else:
     raise AssertionError("invalid execution was accepted")
 reply=client.finish(force=True)
-assert reply == {"state":"finished", "executions":[], "worktrees_preserved":True}, reply
-assert client.finish() == reply
+business = lambda result: {key: value for key, value in result.items() if key != "diagnostics"}
+assert business(reply) == {"state":"finished", "executions":[], "worktrees_preserved":True}, reply
+again = client.finish()
+assert business(again) == business(reply)
+assert reply["diagnostics"]["operation_id"] != again["diagnostics"]["operation_id"]
+assert all(result["diagnostics"]["status"] == "success" and result["diagnostics"]["finished_at"]
+           for result in (reply, again))
 assert client._service is None
 assert not (Path(sys.argv[1]) / "coordinator").exists()
 assert client.status()["session"]["state"] == "finished"
+pure_diagnostics = {"remote_dev", "remote_dev.observability", "remote_dev.core", "remote_dev.core.errors"}
+assert {name for name in sys.modules if name == "remote_dev" or name.startswith("remote_dev.")} <= pure_diagnostics
+assert "vaws_coordinator.service" not in sys.modules
 print(json.dumps(reply))
 '''
     result = subprocess.run([sys.executable, "-c", script, str(tmp_path)],
-                            env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])},
+                            env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
+                                 "VAWS_DIAGNOSTICS_ROOT": str(tmp_path / "diagnostics"),
+                                 "VAWS_COORDINATOR_STATE_DIR": str(tmp_path / "coordinator")},
                             capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stdout + result.stderr
 
