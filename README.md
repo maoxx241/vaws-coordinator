@@ -386,7 +386,7 @@ dependencies from an index:
 
 ```bash
 uv venv
-uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@4da7bbdd6b1a5d809d53522c9ee0b0b1d7d2e83c"
+uv pip install "vaws-remote-dev @ git+https://github.com/vllm-ascend-workspace/remote-dev@6d7359776d052b7f880a853976b9d82b0e706a65"
 uv pip install pytest "jsonschema>=4" "setuptools-scm>=8"
 uv pip install -e . --no-deps
 .venv/bin/python -m pytest
