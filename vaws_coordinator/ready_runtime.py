@@ -783,11 +783,34 @@ class RuntimePool(ManagedExecution):
         return {"run": run, "jobs": jobs, "event": event,
                 "next": "return the runtime for quarantine and re-verification before any reuse"}
 
-    def tick(self, limit: int = 4, *, exclude_managed=()):
+    def tick(self, limit: int = 4, *, exclude_managed=(), background=False):
         """Observe manual leases and supervise explicitly registered jobs."""
         with self.transaction() as db:
             managed = {row["id"] for row in self.rows(db, "job")}
             rows = [row for row in self.rows(db, "run") if row["state"] not in TERMINAL and row["id"] not in managed]
+        if background:
+            with self.transaction() as db:
+                jobs = [row for row in self.rows(db, 'job')
+                        if row['state'] not in JOB_TERMINAL and row['id'] not in exclude_managed]
+            candidates = [(row, False) for row in rows] + [(row, True) for row in jobs]
+            started = 0
+            for row, managed in sorted(candidates, key=lambda item: item[0]['last_poll']):
+                lock = self._entity_lock('background-tick', row['id'])
+                if not lock.acquire(blocking=False):
+                    continue
+                def advance(row=row, managed=managed, lock=lock):
+                    try:
+                        if managed:
+                            self.managed_advance(row['id'], wait=False)
+                        else:
+                            self.control(row['owner'], row['id'], 'poll')
+                    finally:
+                        lock.release()
+                threading.Thread(target=advance, name='vaws-pool-' + row['id'][:12], daemon=True).start()
+                started += 1
+                if started >= limit:
+                    break
+            return
         for row in sorted(rows, key=lambda row: row["last_poll"])[:limit]:
             self.control(row["owner"], row["id"], "poll")
         self.managed_tick(limit, exclude=exclude_managed)

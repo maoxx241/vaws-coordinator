@@ -68,7 +68,9 @@ def test_supported_recipe_build_inputs_include_python_codegen_and_build_configur
         return build_input_fingerprints(tmp_path, 'HEAD', VLLM_ASCEND_REINSTALL_PATTERNS, build_env={})
     baseline = commit()
     (tmp_path / 'vllm_ascend/model.py').write_text('business Python edit')
-    assert commit() == baseline
+    edited = commit()
+    assert {k: v for k, v in edited.items() if k != 'imports'} == {k: v for k, v in baseline.items() if k != 'imports'}
+    assert edited['imports'] != baseline['imports']
     (tmp_path / 'csrc/generate.py').write_text('code generator edit')
     generated = commit()
     assert generated['native'] != baseline['native']

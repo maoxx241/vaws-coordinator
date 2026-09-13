@@ -42,7 +42,7 @@ def submodule_content(repo: Path, commit: str) -> str:
 
 
 def build_input_fingerprints(repo: Path, commit: str, patterns: tuple[str, ...], *, build_env=None) -> dict[str, str]:
-    native, dependencies = [], []
+    native, dependencies, imports = [], [], []
     tree = subprocess.check_output(['git', '-C', str(repo), 'ls-tree', '-r', '-z', commit], stdin=subprocess.DEVNULL, text=True, encoding="utf-8")
     for entry in filter(None, tree.split('\0')):
         metadata, path = entry.split('\t', 1)
@@ -52,12 +52,17 @@ def build_input_fingerprints(repo: Path, commit: str, patterns: tuple[str, ...],
         token = f'{mode}\0{path}\0{oid}'
         if kind == 'commit' or any(fnmatch.fnmatch(path, pattern) for pattern in patterns):
             native.append(token)
+        # Conservative import closure: retain every tracked resource except
+        # native compiler source. Loaded extensions are hashed separately.
+        if kind == 'commit' or Path(path).suffix.lower() not in {'.cpp', '.cc', '.cxx', '.c', '.h', '.hpp', '.cuh', '.cu'}:
+            imports.append(token)
         if any(fnmatch.fnmatch(path, pattern) for pattern in DEPENDENCY_INSTALL_PATTERNS):
             dependencies.append(token)
     source = os.environ if build_env is None else build_env
     environment = {key: source[key] for key in BUILD_INPUT_ENV_KEYS if key in source}
     return {
         'native': hashlib.sha256(json.dumps(sorted(native)).encode()).hexdigest(),
+        'imports': hashlib.sha256(json.dumps(sorted(imports)).encode()).hexdigest(),
         'dependencies': hashlib.sha256(json.dumps(sorted(dependencies)).encode()).hexdigest(),
         'build_env': hashlib.sha256(json.dumps(environment, sort_keys=True).encode()).hexdigest(),
     }

@@ -85,7 +85,9 @@ def native_loader(tmp_path, monkeypatch):
     for path in reversed(environment['PYTHONPATH'].split(':')):
         monkeypatch.syspath_prepend(path)
     monkeypatch.setenv('CXX', '1.0')
-    monkeypatch.setattr(profile.importlib.metadata, 'version', lambda name: '1.0')
+    real_version = profile.importlib.metadata.version
+    monkeypatch.setattr(profile.importlib.metadata, 'version',
+                        lambda name: '1.0' if name in {'torch', 'torch-npu'} else real_version(name))
     settings = {name: '1.0' for name in profile.PROFILE_FIELDS}
     settings.update(python_abi=profile.sysconfig.get_config_var('SOABI'), build_env={}, launch_env=environment,
                     compatibility_evidence='.vaws-runtime/profile-evidence/smoke.json', system_files=system)

@@ -202,17 +202,20 @@ def test_one_failed_build_cannot_make_other_unquiet_preparation_terminal(tmp_pat
     assert reply["state"] == "uncertain" and reply["resources_released"] is False
 
 
-def test_cancel_while_waiting_for_other_executions_host_lock(tmp_path, monkeypatch):
+def test_cancel_while_waiting_for_other_executions_compiler(tmp_path, monkeypatch):
     store = AgentSessions(tmp_path / "sessions")
     context = store.attach("codex", "waiting-task", str(tmp_path))
-    row = store.execution(context, "queued-build", {"command": "build"})
-    row.update(user="user", phase="preparing")
+    row = store.execution(context, "queued-build", {"command": "build", "source_snapshot": {}})
+    row.update(user="user", phase="preparing", sources={}, remote_session={"id": "remote"})
     store.save_execution(row)
     service = CoordinatorService(tmp_path / "coordinator", pool=MagicMock())
     monkeypatch.setattr(service, "_donor_for_role", lambda *a: {"host": "host-a"})
     prepared = Mock()
-    monkeypatch.setattr(service, "_prepare_role", prepared)
-    host_lock = service._lock_for("prepare-host", "host-a")
+    def prepare_environment(*args, **kwargs):
+        with kwargs['compile_scope']('install-vllm-ascend'):
+            prepared()
+    monkeypatch.setattr('vaws_coordinator.provision.prepare_task_environment', prepare_environment)
+    host_lock = service._lock_for("compile-host", "host-a")
     host_lock.acquire()
     result = []
     waiter = threading.Thread(target=lambda: result.append(service._place_or_prepare(

@@ -8,6 +8,7 @@ from __future__ import annotations
 import re
 import json
 import shlex
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import PurePosixPath
 
@@ -97,6 +98,16 @@ class ManagedExecution:
             elif action not in {"status", "tail"}:
                 raise ValueError("managed execution action must be status, tail or stop")
         if action == "tail":
+            remote = job.get('remote') or {}
+            # Completion exchange already returns a bounded tail. Reuse only
+            # this exact drained job, never an earlier/status-only snapshot.
+            if (job['state'] in JOB_TERMINAL and job.get('lease_state') in LEASE_TERMINAL
+                    and remote.get('state') in JOB_TERMINAL and remote.get('quiet') is True
+                    and not remote.get('unknown')
+                    and (remote.get('receipt') or {}).get('job_id') == job['job_id']
+                    and (remote.get('result') or {}).get('descendants_drained') is True
+                    and all(isinstance(remote.get(key), str) for key in ('stdout', 'stderr'))):
+                return job
             return {**job, "remote": self.backend.job(runtime, job["job_id"], "tail")}
         return self.managed_advance(job_id) if job["state"] not in JOB_TERMINAL else job
 
@@ -107,7 +118,7 @@ class ManagedExecution:
             self.put(db, "job", job)
         return self.managed_advance(job_id)
 
-    def managed_advance(self, key, *, wait=True):
+    def managed_advance(self, key, *, wait=True, _completed_observation=None):
         # Per-job lock: remote probes/supervision for one job never block
         # another job's advancement; the global lock guards only DB sections.
         lock = self._entity_lock("job", key)
@@ -154,6 +165,7 @@ class ManagedExecution:
                 known_absent = (not runs and run["state"] in {"pending", "queued", "granted", "starting", "cancelled"}
                                 and not job.get("had_receipt") and not (job.get("remote") or {}).get("receipt"))
                 observed = ({"state": "absent", "quiet": True} if known_absent
+                            else _completed_observation if _completed_observation is not None
                             else self.backend.job(runtime, job["job_id"], "status"))
                 job["had_receipt"] = bool(job.get("had_receipt") or observed.get("receipt")
                                           or (job.get("remote") or {}).get("receipt"))
@@ -274,6 +286,49 @@ class ManagedExecution:
             return self._save_managed(job)
         finally:
             lock.release()
+
+    def watch_completion(self, key, on_complete, stopped):
+        """One owned wait per job, outside all control/lease locks.
+
+        The regular supervision budget still renews leases. This observer only
+        accelerates terminal completion; it cannot launch or replay a job.
+        """
+        if not callable(getattr(self.backend, 'wait_job', None)):
+            return
+        lock = self._entity_lock('completion-watch', key)
+        if not lock.acquire(blocking=False):
+            return
+        def watch():
+            drain_delay = 0.1
+            try:
+                while not stopped.is_set():
+                    with self.transaction() as db:
+                        job = self.get(db, 'job', key)
+                        binding = self.get(db, 'binding', job['binding_id'])
+                        runtime = self.get(db, 'runtime', binding['runtime_id'])
+                    if job['state'] in JOB_TERMINAL or job['state'] != 'running':
+                        return
+                    observed = self.backend.wait_job(runtime, job['job_id'], timeout_seconds=10)
+                    if observed.get('quiet') is True and observed.get('state') not in {'absent', 'prepared', 'running'}:
+                        completed = self.managed_advance(key, _completed_observation=observed)
+                        on_complete(completed)
+                        return
+                    if observed.get('state') != 'running':
+                        if observed.get('state') in {'absent', 'prepared', 'uncertain', 'lost_outcome'} or observed.get('unknown'):
+                            return
+                        # Result publication may precede descendant quiet by a
+                        # short drain interval. Exchange already wakes on the
+                        # result file; back off locally instead of rapid RPCs.
+                        if stopped.wait(drain_delay):
+                            return
+                        drain_delay = min(1.0, drain_delay * 2)
+            except Exception:
+                # Ordinary status/recovery remains authoritative after a lost
+                # wait reply. Never manufacture quiet or resend the command.
+                return
+            finally:
+                lock.release()
+        threading.Thread(target=watch, name='vaws-completion-' + key[:12], daemon=True).start()
 
     def _refresh_managed_cancel(self, job):
         with self.transaction() as db:

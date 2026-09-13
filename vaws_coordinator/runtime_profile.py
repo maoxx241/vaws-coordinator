@@ -349,6 +349,18 @@ def native_vendor_launch_environment(root: Path, files: dict, environment: dict[
     return result
 
 
+def installed_dependency_identity() -> dict[str, Any]:
+    """Resolved installed metadata without importing the dependency packages."""
+    packages, origins = {}, {}
+    for distribution in importlib.metadata.distributions():
+        name = re.sub(r'[-_.]+', '-', distribution.metadata.get('Name', '')).lower()
+        if name and name not in {'vllm', 'vllm-ascend'}:
+            if name not in packages:
+                packages[name] = distribution.version
+                origins[name] = str(Path(distribution.locate_file('')).resolve())
+    return {'packages': packages, 'dependency_origins': origins}
+
+
 def native_import_smoke(root: Path, profile: dict, inputs: dict) -> dict:
     """Import in a new process so the loader sees the final owned environment."""
     import subprocess
@@ -498,7 +510,51 @@ def native_compatibility_key(manifest: dict[str, Any]) -> str:
     environment.update(build_env=profile['build_env'], system_files=profile['system_files'],
                        packages=profile.get('packages', {}),
                        launch_env=loader_environment)
+    if 'dependency_origins' in profile:
+        environment['dependency_origins'] = profile['dependency_origins']
     return digest({'environment': environment, 'inputs': source_inputs, 'files': manifest['files']})
+
+
+def native_import_closure_key(manifest: dict[str, Any]) -> str:
+    """Import proof identity; AI-core device payloads are verified separately.
+
+    All tracked non-compiler resources, dependency inputs, CPU shared objects,
+    generated Python metadata and loader paths remain in the identity. Device
+    .o/config/source and compile recipes cannot be executed by Python import.
+    """
+    inputs = {}
+    for name, row in manifest['build_inputs'].items():
+        if not isinstance(row, dict) or not re.fullmatch(r'[0-9a-f]{64}', str(row.get('imports', ''))):
+            raise ValueError('import proof reuse requires a captured source closure')
+        inputs[name] = {**row, 'native': row['imports']}
+    files = {path: row for path, row in manifest['files'].items()
+             if path != '.vaws-runtime/kernel-compile-recipe.json'
+             and not ('/op_impl/ai_core/tbe/' in path and
+                      ('/kernel/' in path or '/ascendc/' in path) and
+                      PurePosixPath(path).suffix in {'.o', '.json', '.cpp', '.h'})}
+    return native_compatibility_key({**manifest, 'build_inputs': inputs, 'files': files})
+
+
+def native_import_receipt(root: Path, manifest: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        key = native_import_closure_key(manifest)
+    except (KeyError, ValueError):
+        return None
+    row = manifest['evidence']['smoke']
+    data = checked_file(root, row['path']).read_bytes()
+    if hashlib.sha256(data).hexdigest() != row['sha256']:
+        raise ValueError('donor import evidence changed after verification')
+    smoke = json.loads(data)
+    if smoke.get('kind') == 'native-import-closure-reuse':
+        return smoke['compatibility']
+    if smoke.get('kind') == 'native-compatibility-reuse':
+        # A source-changing native view did not import its changed Python.
+        # It cannot establish an import closure from the native-only proof.
+        return None
+    if smoke.get('passed') is not True:
+        raise ValueError('import closure requires an original successful import')
+    return {'key': key, 'origin': {'profile_key': manifest['profile_key'],
+            'build_key': manifest['build_key'], 'build_inputs': manifest['build_inputs'], 'smoke': smoke}}
 
 
 def native_source_mapping(root: Path) -> dict[str, str]:
@@ -550,6 +606,8 @@ def native_compatibility_receipt(root: Path, manifest: dict[str, Any]) -> dict[s
     smoke = json.loads(data)
     if smoke.get('kind') == 'native-compatibility-reuse':
         return smoke['compatibility']
+    if smoke.get('kind') == 'native-import-closure-reuse':
+        return {'key': key, 'origin': smoke['compatibility']['origin']}
     if smoke.get('passed') is not True:
         raise ValueError('native compatibility requires a successful original import')
     return {'key': key, 'origin': {'profile_key': manifest['profile_key'],
@@ -564,8 +622,9 @@ def verify_native_compatibility(root: Path, manifest: dict[str, Any], smoke: dic
     if (smoke.get('python_import_executed') is not False or 'passed' in smoke
             or smoke.get('profile_key') != manifest['profile_key'] or smoke.get('build_inputs') != manifest['build_inputs']
             or any(not re.fullmatch(r'[0-9a-f]{64}', str(origin.get(key, ''))) for key in ('profile_key', 'build_key'))
-            or certificate.get('key') != native_compatibility_key(manifest)
-            or original.get('passed') is not True or original.get('kind') == 'native-compatibility-reuse'
+            or certificate.get('key') != (native_import_closure_key(manifest)
+                if smoke.get('kind') == 'native-import-closure-reuse' else native_compatibility_key(manifest))
+            or original.get('passed') is not True or original.get('kind') in {'native-compatibility-reuse', 'native-import-closure-reuse'}
             or original.get('profile_key') not in (None, origin.get('profile_key'))
             or original.get('build_inputs') not in (None, origin.get('build_inputs'))):
         raise ValueError('reused native compatibility evidence does not match this environment and bundle')
@@ -586,6 +645,8 @@ def verify_environment(root: Path, manifest: dict[str, Any]) -> None:
     for package, version in profile.get('packages', {}).items():
         if importlib.metadata.version(package) != version:
             raise ValueError(f'profile dependency changed: {package}')
+    if 'dependency_origins' in profile and installed_dependency_identity()['dependency_origins'] != profile['dependency_origins']:
+        raise ValueError('installed dependency locations changed')
     for row in profile['system_files'].values():
         if file_digest(Path(row['path'])) != row['sha256']:
             raise ValueError('CANN/driver/runtime support file changed')
@@ -647,7 +708,7 @@ def _verify_manifest_proof(root: Path, manifest: dict[str, Any], *, check_enviro
         smoke = json.loads(checked_file(root, manifest['evidence']['smoke']['path']).read_text(encoding='utf-8'))
     except (ValueError, UnicodeError) as exc:
         raise ValueError('import-smoke evidence must be a successful structured receipt') from exc
-    if smoke.get('kind') == 'native-compatibility-reuse':
+    if smoke.get('kind') in {'native-compatibility-reuse', 'native-import-closure-reuse'}:
         verify_native_compatibility(root, manifest, smoke, check_environment=check_environment)
     elif smoke.get('passed') is not True:
         raise ValueError('import-smoke evidence did not pass')

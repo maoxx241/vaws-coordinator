@@ -20,6 +20,8 @@ from vaws_coordinator.provision.task_environment import reusable_preparation
 
 @pytest.fixture
 def bundle(tmp_path, monkeypatch):
+    monkeypatch.setattr(cache, 'native_import_receipt', profile.native_import_receipt, raising=False)
+    monkeypatch.setattr(cache, 'native_import_receipt', profile.native_import_receipt, raising=False)
     source, target, shared = tmp_path / 'alice-build', tmp_path / 'bob-execution', tmp_path / 'host-cache'
     system = tmp_path / 'image-system'
     system.mkdir()

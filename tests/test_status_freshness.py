@@ -158,6 +158,13 @@ def test_slow_role_does_not_block_a_healthy_siblings_lease_renewal(task):
     slow_job = roles["slow"]["observation"]["job_id"]
     healthy_job = roles["healthy"]["observation"]["job_id"]
     slow_entered, healthy_entered, release = threading.Event(), threading.Event(), threading.Event()
+    renewed = threading.Event()
+    original_host = task.backend.host
+    def host(runtime, request):
+        result = original_host(runtime, request)
+        if request["action"] == "heartbeat":
+            renewed.set()
+        return result
     original = task.backend.job
     def delayed(runtime, job, action, **kwargs):
         if action == "status" and job == slow_job:
@@ -166,7 +173,7 @@ def test_slow_role_does_not_block_a_healthy_siblings_lease_renewal(task):
         elif action == "status" and job == healthy_job:
             healthy_entered.set()
         return original(runtime, job, action, **kwargs)
-    with mock.patch.object(task.backend, "job", side_effect=delayed):
+    with mock.patch.object(task.backend, "job", side_effect=delayed), mock.patch.object(task.backend, "host", side_effect=host):
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(task.client.observe, execution, refresh=True)
             try:
@@ -174,7 +181,9 @@ def test_slow_role_does_not_block_a_healthy_siblings_lease_renewal(task):
                 with task.pool._entity_lock("job", roles["healthy"]["managed_job"]):
                     pass
                 task.backend.calls.clear()
+                renewed.clear()
                 task.client.coordinator._dispatch_progress()
+                assert renewed.wait(2), "healthy renewal must complete while the slow sibling remains blocked"
                 assert ("host", "heartbeat") in task.backend.calls
                 assert ("job", "stop") not in task.backend.calls
             finally:

@@ -250,6 +250,24 @@ def receipt(row):
                       "preparation_timings": {"native_compile": 4.5}, "native_cache": {"status": "stored"}}
 
 
+@pytest.mark.parametrize('previous_miss', [False, True])
+def test_materialization_timing_is_readable_without_a_full_manifest(owned, previous_miss):
+    owner, store, client, row = owned
+    row['role_progress'] = {'default': {'step': 'materialize'}}
+    owner._save_execution(store, row)
+    directory = owner.state_dir / 'runs' / row['id'] / 'default'
+    directory.mkdir(parents=True)
+    timing = {'materialize': 2.0, 'source_metadata': 0.1, 'native_publication': 0.8}
+    previous = (json.dumps({'status': 'missing', 'preparation_timings': {'materialize': 0.01}}) + '\n'
+                if previous_miss else '')
+    (directory / 'materialize.log').write_text(previous + json.dumps({'status': 'materialized',
+        'preparation_timings': timing, 'native_smoke_executed': False}))
+    owner.pool.managed_control = Mock(side_effect=AssertionError('no remote probe'))
+    result = client.observe(row['id'], action='evidence', section='preparation')
+    log = result['evidence']['roles'][0]['logs'][0]
+    assert log['preparation_timings'] == timing and log['native_smoke_executed'] is False
+
+
 @pytest.mark.parametrize("log_name", ["verify-profile.log", "finalize-runtime.log", "materialize-sources.log"])
 def test_evidence_decodes_owned_receipts_without_remote_reads(owned, log_name):
     owner, store, client, row = owned

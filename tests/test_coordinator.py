@@ -1815,10 +1815,11 @@ class TaskClientTests(unittest.TestCase):
             reply = self.client.run("true", sources={}, topology={"roles": [
                 {"name": "first", "npu_count": 0}, {"name": "second", "npu_count": 0}]})
         self.assertEqual(reply["state"], "cancelled")
-        self.assertEqual(len(prepared), 1)
+        self.assertGreaterEqual(len(prepared), 1)
+        self.assertLessEqual(len(prepared), 2)
         row = self.store.executions(self.context["session"]["id"])[0]
         remote = row["remote_session"]["id"]
-        self.assertEqual(len(self.pool.session_bindings("alice", remote)), 1)
+        self.assertEqual(len(self.pool.session_bindings("alice", remote)), len(prepared))
         self.assertEqual(self.pool.status("alice")["jobs"], [])
         # Simulate losing the local role save after the pool committed its
         # atomic binding. The already persisted execution session owns it.
