@@ -82,11 +82,20 @@ def attach_native(store: AgentSessions, client: str, native: str, cwd: str) -> t
     return store, store.attach(client, native, cwd, parent_context=parent, association=association)
 
 
-def in_project_scope(cwd: Path, project: Path) -> bool:
+def in_project_scope(cwd: Path, project: Path, *, sources: dict[str, str] | None = None) -> bool:
     """Include actual worktrees of this repository, never a similarly named clone."""
     cwd, project = cwd.resolve(), project.resolve()
     if cwd == project:
         return True
+    if sources is not None:
+        # The consumer supplies explicitly prepared roots. Never discover
+        # arbitrary nested repositories or infer task association from them.
+        actual = subprocess.run(
+            ["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, encoding="utf-8", timeout=5, check=True,
+        ).stdout.strip()
+        if Path(client_path(actual)).resolve() in {Path(client_path(path)).resolve() for path in sources.values()}:
+            return True
     inside = project in cwd.parents
     try:
         common = git_common_directory(project)
@@ -115,17 +124,18 @@ def in_project_scope(cwd: Path, project: Path) -> bool:
     return False
 
 
-def bind_native_defaults(store: AgentSessions, context: dict) -> dict:
+def bind_native_defaults(store: AgentSessions, context: dict, sources: dict[str, str] | None = None) -> dict:
     try:
-        return store.bind_native_sources(context)
+        return store.bind_native_sources(context, sources=sources)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         # An unborn/non-Git or inaccessible directory still has a local task.
         # attach() clears old automatic sources when the native cwd changes.
         print(f"VAWS: source reference not yet bound: {type(exc).__name__}", file=sys.stderr)
-        return context
+        return store.context(context["attachment"]["id"]) if sources is not None else context
 
 
-def handle(client: str, payload: dict, store: AgentSessions | None = None) -> dict:
+def handle(client: str, payload: dict, store: AgentSessions | None = None, *,
+           sources: dict[str, str] | None = None) -> dict:
     if client == "claude" and (GROK_EVENT_FIELD in payload or CURSOR_VERSION_FIELD in payload):
         return {}
     # Grok also imports Cursor hooks by default.
@@ -150,7 +160,7 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
                 context = store.attach(client, native, str(cwd))
         else:
             store, context = attach_native(store, client, native, str(cwd))
-        context = bind_native_defaults(store, context)
+        context = bind_native_defaults(store, context, sources)
     elif normalized in {"subagentstart", "subagentstop"}:
         parent_native = str(payload.get("parent_conversation_id") or payload.get("parentSessionId") or native)
         parent_agent = str(payload.get("parent_agent_id") or "") if client == "kimi" else ""
@@ -162,7 +172,7 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
         if normalized == "subagentstop":
             store.detach(context)
             return {}
-        context = bind_native_defaults(store, context)
+        context = bind_native_defaults(store, context, sources)
     else:
         agent_id = str(payload.get("agent_id") or "")
         if client == "kimi" and agent_id == "main":
@@ -173,7 +183,7 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
             if not cursor_pretool or agent_id:
                 raise
             store, context = attach_native(store, client, native, str(cwd))
-            context = bind_native_defaults(store, context)
+            context = bind_native_defaults(store, context, sources)
         if normalized == "sessionend":
             store.detach(context)
             return {}
@@ -183,7 +193,7 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
             # EnterWorktree can move Claude during one prompt. Its next tool
             # carries the new native cwd; do not wait for another user prompt.
             context = store.attach(client, native, str(cwd), agent_id=context["attachment"].get("agent_id") or "")
-            context = bind_native_defaults(store, context)
+            context = bind_native_defaults(store, context, sources)
 
     context = store.bind_configured_user(context)
     if client in {"claude", "codex", "grok", "cursor"} and normalized in {"userpromptsubmit", "beforesubmitprompt"}:
@@ -233,7 +243,7 @@ def handle(client: str, payload: dict, store: AgentSessions | None = None) -> di
     return {}
 
 
-def main():
+def main(*, sources: dict[str, str] | None = None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--client", choices=sorted(CLIENTS), required=True)
     parser.add_argument("--project", help="Scope a global hook (notably Kimi) to this project")
@@ -247,12 +257,12 @@ def main():
             cwd = Path(client_path(payload.get("cwd") or payload.get("workspaceRoot") or
                        (payload.get("workspace_roots") or [str(Path.cwd())])[0])).resolve()
             project = Path(client_path(args.project)).expanduser().resolve()
-            if not in_project_scope(cwd, project):
+            if not in_project_scope(cwd, project, sources=sources):
                 # Kimi appends stdout to the user prompt; a literal {} would
                 # pollute every prompt outside this project. Stay silent.
                 print("")
                 return 0
-        output = handle(args.client, payload)
+        output = handle(args.client, payload, sources=sources)
         # Kimi's UserPromptSubmit contract appends returned text, rather than
         # relying on Claude's additionalContext extension.
         if args.client == "kimi" and payload.get("hook_event_name") == "UserPromptSubmit":
