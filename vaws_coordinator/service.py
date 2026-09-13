@@ -416,7 +416,13 @@ class CoordinatorService(TaskMessages):
                 # a missed external update. No client-side status RPC loop.
                 self._changed.wait(min(remaining, STATUS_CACHE_SECONDS))
         if terminal:
-            reply = self._wait_terminal_logs(sessions_dir, user, execution_id, reply, deadline, role)
+            if reply.get("resources_released") is True:
+                reply = self._wait_terminal_logs(sessions_dir, user, execution_id, reply, deadline, role)
+            else:
+                # Terminal business state can precede descendant/lease cleanup.
+                # Its log is still growing; only the final released view may
+                # populate the reusable completion log cache.
+                reply = {**reply, "logs_pending": True}
         return {**reply, "wait_until": until, **({"wait_timed_out": True} if not reached else {})}
 
     def _owned_row(self, sessions_dir, user, execution_id):

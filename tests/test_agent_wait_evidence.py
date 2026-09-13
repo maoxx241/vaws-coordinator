@@ -79,19 +79,25 @@ def test_release_wait_keeps_cleanup_facts_and_reads_terminal_logs_once(owned):
     row.update(phase="failed", roles=[{"name": "default", "binding": {}, "managed_job": "job",
                                       "observation": {"state": "failed", "lease_state": "active", "remote": {"quiet": False}}}])
     owner._save_execution(store, row)
-    owner.pool.managed_control = Mock(return_value={"remote": {"stdout": "complete output", "stderr": "failure details"}})
+    owner.pool.managed_control = Mock(return_value={"remote": {"stdout": "early output", "stderr": "early failure"}})
     first = client.wait(row["id"], until="released", timeout_seconds=0)
     assert first["wait_timed_out"] is True and first["resources_released"] is False
     # The business failure can be reported immediately for a running wait.
     failure = client.wait(row["id"], until="running", timeout_seconds=2)
     assert failure["state"] == "failed" and failure["roles"][0]["quiet"] is False
-    assert failure["stderr"] == "failure details"
+    assert failure["logs_pending"] is True and "stderr" not in failure
+    owner.pool.managed_control.assert_not_called()
     _, current = owner._owned_row(store.state_dir, "alice", row["id"])
+    assert "terminal_logs" not in current
     current["roles"][0]["observation"].update(lease_state="released", remote={"quiet": True})
     owner._save_execution(store, current)
+    owner.pool.managed_control.return_value = {"remote": {"stdout": "complete output", "stderr": "failure details after cleanup"}}
     last = client.wait(row["id"], until="released", timeout_seconds=2)
     assert last["resources_released"] is True and last["state"] == "failed"
     assert last["roles"][0]["quiet"] is True and last["stdout"] == "complete output"
+    assert last["stderr"] == "failure details after cleanup"
+    again = client.wait(row["id"], until="released", timeout_seconds=2)
+    assert again["stderr"] == last["stderr"]
     assert owner.pool.managed_control.call_count == 1
     assert owner.pool.managed_control.call_args.args == ("alice", "job", "tail")
 
@@ -118,10 +124,10 @@ def test_terminal_tail_failure_and_slow_tail_do_not_change_outcome_or_block_cont
     assert "log transport unavailable" in result["tail_error"]
 
 
-def test_terminal_log_publication_serializes_with_release_worker(owned):
+def test_terminal_log_publication_serializes_with_latest_lifecycle_facts(owned):
     owner, store, client, row = owned
     row.update(phase="failed", roles=[{"name": "default", "binding": {}, "managed_job": "job",
-        "observation": {"state": "failed", "lease_state": "active", "remote": {"quiet": False}}}])
+        "observation": {"state": "failed", "lease_state": "released", "remote": {"quiet": True}}}])
     owner._save_execution(store, row)
     entered, released = threading.Event(), threading.Event()
     def tail(*args, **kwargs):
@@ -141,11 +147,12 @@ def test_terminal_log_publication_serializes_with_release_worker(owned):
         assert entered.wait(1)
         with owner._lock_for("execution", row["id"]):
             _, current = owner._owned_row(store.state_dir, "alice", row["id"])
-            current["roles"][0]["observation"].update(lease_state="released", remote={"quiet": True})
+            current["error"] = "latest cleanup detail"
             owner._save_execution(store, current)
         released.set()
         reply = result.result(timeout=1)
     assert reply["resources_released"] is True and reply["roles"][0]["quiet"] is True
+    assert reply["error"] == "latest cleanup detail"
     assert reply["stdout"] == "business exit"
 
 
