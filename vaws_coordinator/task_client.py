@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import getpass
-import math
-import time
+import hashlib
 from pathlib import Path
 
 from vaws_coordinator.agent_session import AgentSessions, load_context
+from vaws_coordinator.client_paths import client_path
 from vaws_coordinator.placement import normalize_environment, normalize_resources, role_plan, validate_user_env
 from vaws_coordinator.ready_runtime import safe_id
 from vaws_coordinator.state_paths import coordinator_state_dir
@@ -41,12 +41,10 @@ class TaskClient:
             sources={"vllm": "/local/vllm", "vllm-ascend": "/local/vllm-ascend"},
             resources={"devices": [0]},
             topology={"host": "npu-host"},
+            wait_until="released", wait_timeout_seconds=180,
         )
         execution_id = run["execution_id"]
-        status = client.wait(execution_id, until="released", timeout_seconds=30)
-        print(status["state"], status["resources_released"])
-        log = client.observe(execution_id, action="tail")
-        print(log.get("tail", ""))
+        print(run["state"], run["resources_released"], run.get("stdout", ""))
 
     Use the native attachment's supplied context_file path. TaskClient() can
     instead resolve VAWS_CONTEXT_FILE or the actual native task context; no
@@ -62,11 +60,23 @@ class TaskClient:
     Only for explicitly intended sharing, add allow_external_busy=True with
     exactly one devices entry; other managed leases still conflict.
 
-    run returns an execution_id after admission, before business completion.
+    run returns after admission unless wait_until is supplied. Alternatively,
+    script_file="/local/business.sh" captures a UTF-8 shell file (up to 1 MiB)
+    instead of command. UTF-8 BOM and CRLF are normalized for the remote shell;
+    raw and submitted-command digests are recorded. Its local path is not
+    part of service identity. CLI: run --script-file business.sh --wait released
+    --wait-timeout-seconds 180. Business timeout_seconds is a separate limit.
     wait(until="released") confirms termination and resource release, including
     failed executions: success also requires state == "succeeded". A bounded
     wait may return wait_timed_out=True; inspect it and wait on the same id again
     as needed. This observation timeout does not stop or resubmit the execution.
+    Wait budgets are 0-600 seconds. The owner waits internally; no client status
+    loop is needed. Terminal wait includes cached stdout/stderr/tail, or an
+    explicit tail_error/logs_pending; logs never change lifecycle facts.
+    Remote completion still follows the owner's two-second supervision cadence.
+    observe(action="evidence", section="build", path="operator") reads recorded
+    source/preparation/build receipts and artifact hashes, with raw refs. It
+    does not revalidate mutable remote files or prove business correctness.
     observe(action="tail") returns logs (tail and separate stdout/stderr).
     observe(action="status", refresh=False) reads cached progress;
     observe(action="stop") stops that execution. finish() closes the whole task
@@ -145,8 +155,9 @@ class TaskClient:
         self.context = self.store.bind_sources(self.context, sources)
         return self.context
 
-    def run(self, command, *, sources=None, env=None, environment=None, resources=None, topology=None,
-            timeout_seconds=1800, service=None, restart=False, preflight=None):
+    def run(self, command=None, *, script_file=None, sources=None, env=None, environment=None, resources=None, topology=None,
+            timeout_seconds=1800, service=None, restart=False, preflight=None,
+            wait_until=None, wait_timeout_seconds=30):
         """Admit fixed inputs and resources for one supervised execution.
 
         ``command`` is remote shell code; use ``"$VAWS_PYTHON"`` for the prepared
@@ -157,11 +168,30 @@ class TaskClient:
         selects a host. The returned ``execution_id`` identifies admitted work,
         not a completed command. Read logs with ``observe(action="tail")`` and
         confirm completion with ``wait(until="released")`` on that id.
+        Supply ``wait_until`` and ``wait_timeout_seconds`` to combine admission
+        and that bounded wait. ``script_file`` replaces ``command`` with the
+        UTF-8 text read once from a local file, at most 1 MiB. A BOM is removed
+        and CRLF becomes LF; original and submitted command digests are kept.
 
         ``resources={"devices": [id], "allow_external_busy": True}`` explicitly
         shares one physical NPU with external processes. Other managed leases
         remain exclusive; stopping this execution only stops its own family.
         """
+        from vaws_coordinator.service import validate_wait
+        if wait_until is not None:
+            validate_wait(wait_until, wait_timeout_seconds)
+        script = None
+        if script_file is not None:
+            if command is not None:
+                raise ValueError("provide exactly one of command or script_file")
+            path = Path(client_path(script_file)).expanduser().resolve()
+            with path.open("rb") as stream:
+                raw = stream.read(1024 * 1024 + 1)
+            if len(raw) > 1024 * 1024 or b'\x00' in raw:
+                raise ValueError("script_file must be UTF-8 shell text of at most 1 MiB without NUL bytes")
+            command = raw.decode("utf-8-sig").replace("\r\n", "\n")
+            script = {"path": str(path), "sha256": hashlib.sha256(raw).hexdigest(), "bytes": len(raw),
+                      "command_sha256": hashlib.sha256(command.encode("utf-8")).hexdigest()}
         if not command or not isinstance(command, str) or not command.strip():
             raise ValueError("command is required")
         env = validate_user_env(env)
@@ -187,8 +217,18 @@ class TaskClient:
             "timeout_seconds": timeout_seconds, "service": service,
             "preflight": preflight,
         }
-        return self._with_notifications(self.coordinator.admit(str(self.store.state_dir), self.user,
-                                      self.context["session"]["id"], spec, restart=restart))
+        if script is not None:
+            spec["script"] = script
+        reply = self.coordinator.admit(str(self.store.state_dir), self.user,
+                                      self.context["session"]["id"], spec, restart=restart)
+        if wait_until is not None and reply.get("execution_id"):
+            try:
+                return self.wait(reply["execution_id"], until=wait_until, timeout_seconds=wait_timeout_seconds)
+            except Exception as exc:
+                # Admission has happened. A failed observation must retain its
+                # durable reference rather than invite another submission.
+                return {**reply, "wait_error": f"{type(exc).__name__}: {exc}"[:500]}
+        return self._with_notifications(reply)
 
     def _require_execution_id(self, execution_id):
         if not isinstance(execution_id, str) or len(execution_id) != 64 or any(
@@ -223,21 +263,30 @@ class TaskClient:
         selected = live or sorted(rows, key=lambda row: (row.get("created_at", 0), row["id"]))[-1:]
         return selected[0]["id"] if selected else None
 
-    def observe(self, execution_id=None, action="status", force=False, role=None, refresh=True, *, service=None):
-        """Read status/logs/target or stop one owned execution.
+    def observe(self, execution_id=None, action="status", force=False, role=None, refresh=True, *, service=None,
+                until="released", timeout_seconds=30, section="all", path=None):
+        """Read status/logs/target/evidence, wait for, or stop one owned execution.
 
         Pass the run reply's execution_id, or a task-scoped service name.
         ``action="tail"`` returns ``tail`` and separate ``stdout``/``stderr``
         (per role for multiple roles). Status is fresh by default; use
         ``refresh=False`` for cached progress. Stop requests termination;
         ``wait(until="released")`` confirms resource release afterward.
+        ``action="wait"`` uses ``until`` and ``timeout_seconds`` (0-600).
+        ``action="evidence"`` reads existing local receipts, optionally using
+        ``section`` (all/sources/preparation/build) and artifact ``path`` filter.
         """
-        if action not in {"status", "tail", "stop", "target"}:
+        if action not in {"status", "tail", "stop", "target", "wait", "evidence"}:
             raise ValueError("unsupported execution action")
         execution_id = self.resolve_execution(execution_id, service=service)
         if execution_id is None:
             return {"state": "not_found", "service": service}
         self._require_execution_id(execution_id)
+        if action == "wait":
+            return self.wait(execution_id, until=until, timeout_seconds=timeout_seconds, role=role)
+        if action == "evidence":
+            return self.coordinator.evidence(str(self.store.state_dir), self.user, execution_id,
+                                             role=role, section=section, path=path)
         if action == "target":
             target = self.target(execution_id)
             reply = {"execution_id": execution_id, "state": target["state"], "target": target,
@@ -258,7 +307,7 @@ class TaskClient:
         return self.coordinator.finish(str(self.store.state_dir), self.user,
                                        self.context["session"]["id"], force=force)
 
-    def wait(self, execution_id, *, until="running", timeout_seconds=30, poll_interval=1):
+    def wait(self, execution_id, *, until="running", timeout_seconds=30, role=None):
         """Wait on one owned execution; return the last facts on bounded timeout.
 
         A terminal failure ends a running wait. Release waits end only when
@@ -267,27 +316,11 @@ class TaskClient:
         A timeout returns the last facts plus ``wait_timed_out=True``; inspect
         them and wait on the same id again as needed. This observation timeout
         does not cancel or resubmit the work.
+        The owner uses a condition notification and its existing supervision
+        cadence; terminal logs are fetched once and retained in the execution.
         """
-        if until not in {"running", "released"}:
-            raise ValueError("until must be running or released")
-        if not math.isfinite(timeout_seconds) or timeout_seconds < 0:
-            raise ValueError("timeout_seconds must be finite and nonnegative")
-        if not math.isfinite(poll_interval) or poll_interval <= 0:
-            raise ValueError("poll_interval must be finite and positive")
+        from vaws_coordinator.service import validate_wait
+        validate_wait(until, timeout_seconds)
         self._require_execution_id(execution_id)
-        deadline = time.monotonic() + timeout_seconds
-        notifications = []
-        while True:
-            reply = self.observe(execution_id, refresh=False)
-            notifications.extend(reply.get("notifications", []))
-            if notifications:
-                reply["notifications"] = list(notifications)
-            terminal = reply.get("state") in DONE
-            if until == "running" and (terminal or reply.get("state") == "running"):
-                return reply
-            if until == "released" and terminal and reply.get("resources_released") is True:
-                return reply
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return {**reply, "wait_timed_out": True}
-            time.sleep(min(poll_interval, remaining))
+        return self._with_notifications(self.coordinator.wait(str(self.store.state_dir), self.user, execution_id,
+                                      until=until, timeout_seconds=timeout_seconds, role=role))

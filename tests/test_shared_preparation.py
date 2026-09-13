@@ -280,11 +280,12 @@ def test_normal_preparation_uses_cache_and_rebuilds_failed_hit(tmp_path, monkeyp
     assert installed.count('install-vllm-ascend') == int(failure in {'profile', 'cache-miss', 'repaired-abi'})
     assert installed.count('install-vllm-ascend-requirements') == int(failure in {'cache-miss', 'missing-dependency', 'repaired-abi'})
     if failure is None:
-        assert installed == ['write-marker']
+        assert installed == []
     if failure == 'missing-dependency':
-        assert installed == ['install-vllm-ascend-requirements', 'verify-deps', 'write-marker']
-    assert operations == (['restore', 'discard', 'store'] if failure == 'profile' else ['restore', 'store']
-                          if failure == 'cache-miss' else ['restore', 'revalidate', 'discard', 'store']
+        assert installed == ['install-vllm-ascend-requirements', 'verify-deps']
+    assert 'verify-imports' not in installed and 'write-marker' not in installed
+    assert operations == (['restore', 'discard'] if failure == 'profile' else ['restore']
+                          if failure == 'cache-miss' else ['restore', 'revalidate', 'discard']
                           if failure == 'repaired-abi' else ['restore', 'revalidate']
                           if failure == 'missing-dependency' else ['restore'])
     assert spec['python'] == '/bob/.venv/bin/python'
@@ -340,7 +341,8 @@ def test_cache_metadata_steps_do_not_activate_cann_or_atb(monkeypatch, action):
     commands = []
     def bash(endpoint, command):
         commands.append(command)
-        return '"sha256:image"' if command.startswith('docker inspect') else '{"status":"fixture"}'
+        return ('{"Id":"fixed-container","Image":"sha256:image","State":{"Running":true}}'
+                if command.startswith('docker inspect') else '{"status":"fixture"}')
     monkeypatch.setattr(backend, 'bash', bash)
     spec = {'endpoint': {'root': '/execution'}, 'host_endpoint': {},
             'container_name': 'vaws-fixture', 'python': '/execution/.venv/bin/python'}
@@ -505,10 +507,10 @@ def test_incremental_recipe_never_silently_falls_back_to_full_build(tmp_path, mo
         assert operations == ['restore']
     else:
         assert prepare() is None
-        assert operations == (['restore', 'restore', 'restore', 'store'] if failure == 'later-export' else
-                              ['restore', 'restore', 'store'] if failure == 'export' else ['restore', 'store'])
+        assert operations == (['restore', 'restore', 'restore'] if failure == 'later-export' else
+                              ['restore', 'restore'] if failure == 'export' else ['restore'])
         if failure == 'export':
-            assert process_steps == ['shared-native-restore', 'shared-native-restore-after-export', 'shared-native-store']
+            assert process_steps == ['shared-native-restore', 'shared-native-restore-after-export']
     assert 'install-vllm-ascend' not in installed
     assert 'install-vllm' not in installed and 'install-vllm-ascend-requirements' not in installed
     assert 'verify-imports' not in installed and 'verify-deps' not in installed

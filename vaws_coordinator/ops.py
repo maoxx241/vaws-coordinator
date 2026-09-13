@@ -19,8 +19,8 @@ LOADED_RUNTIMES = [process_identity(name) for name in ("vaws-coordinator", "vaws
 
 TOOL_DESCRIPTIONS = {
     "vaws.session": "Inspect this native session's VAWS task or replace source defaults for future submissions. No machine is required. Tasks with known managed hosts also receive cached coordination messages without waiting for remote polling. Active executions retain their submitted inputs.",
-    "vaws.run": "Submit a managed command with fixed source inputs and environment/resource/topology needs. Omitted sources uses explicit task defaults or this native attachment's automatic cwd binding; sources={} runs without source dependencies. Devices default to zero. Explicit resources.allow_external_busy=true shares one named physical device with external processes while retaining managed lease and process ownership. The coordinator places, prepares, launches and supervises the execution.",
-    "vaws.execution": "Use action=status (default), tail, stop or target with an execution_id or task-scoped service name belonging to this VAWS task. Status reads current progress; stop releases that execution's devices and ports. The container and execution root remain.",
+    "vaws.run": "Submit shell command or a local UTF-8 script_file with fixed sources and environment/resource/topology needs. Use wait_until=running or released and wait_timeout_seconds (0-600) for an owner-side bounded wait; timeout returns the same execution_id without stopping or resubmitting. Terminal waits include logs. Omitted sources uses task defaults; {} has no source dependencies. Devices default to zero. Explicit allow_external_busy shares one named device with external processes, retaining managed ownership.",
+    "vaws.execution": "Observe one owned execution_id or task-scoped service: action=status, wait, tail, evidence, stop or target. wait uses until=running or released, timeout_seconds=0-600; timeout returns the same reference and does not stop or resubmit. Terminal wait includes logs. evidence reads retained source/preparation/build facts and refs, optionally filtered by section and artifact path substring; it does not revalidate remote files. Stop retains the container and source roots.",
     "vaws.finish": "Finish this VAWS task by closing admission and stopping owned executions; the coordinator completes cleanup and returns leases. Preserve the container, worktrees and evidence.",
     "vaws.message": "Send coordination text to a reference returned by run/status (coordination_peers[].reference), or reply using notifications[].reply_reference. Sender, host and thread are filled internally. Messages never execute commands or transfer resource ownership; normal run/status calls receive replies automatically.",
 }
@@ -54,6 +54,9 @@ TOOL_SCHEMAS = {
     "vaws.session": task_schema({"sources": {"type": "object", "additionalProperties": {"type": "string"}}}),
     "vaws.run": task_schema({
         "command": {"type": "string"},
+        "script_file": {"type": "string", "description": "Local UTF-8 shell file, up to 1 MiB, captured once as the command. Mutually exclusive with command."},
+        "wait_until": {"type": "string", "enum": ["running", "released"]},
+        "wait_timeout_seconds": {"type": "number", "minimum": 0, "maximum": 600, "default": 30},
         "sources": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Actual worktrees to capture once. Omit to use explicit task defaults or this attachment's automatic cwd binding; {} selects no sources."},
         "preflight": {"type": "string", "description": "Optional validation command in the prepared root before NPU allocation. It must not require devices or start a service."},
         "env": {"type": "object", "additionalProperties": {"type": "string"}},
@@ -67,12 +70,20 @@ TOOL_SCHEMAS = {
         "timeout_seconds": {"type": ["integer", "null"], "default": 1800},
         "service": {"type": ["string", "null"], "description": "Ensure a task-scoped service with identical fixed sources and configuration. Changed inputs require restart. To connect without capture, use vaws_execution(service=...)."},
         "restart": {"type": "boolean", "description": "Replace a live named service, including one with the same spec"},
-    }, ("command",)),
-    "vaws.execution": task_schema({"execution_id": {"type": "string"}, "service": {"type": "string", "description": "Task-scoped service name, mutually exclusive with execution_id"}, "action": {"type": "string", "enum": ["status", "tail", "stop", "target"]}, "force": {"type": "boolean"}, "refresh": {"type": "boolean", "default": False, "description": "Refresh remote status instead of reusing the last snapshot for up to two seconds. Busy executions return cache age and refresh_deferred."}, "role": {"type": "string", "description": "Optional topology role name for per-role target or tail"}}),
+    }),
+    "vaws.execution": task_schema({"execution_id": {"type": "string"}, "service": {"type": "string", "description": "Task-scoped service name, mutually exclusive with execution_id"}, "action": {"type": "string", "enum": ["status", "wait", "evidence", "tail", "stop", "target"]}, "force": {"type": "boolean"}, "refresh": {"type": "boolean", "default": False, "description": "Refresh remote status instead of reusing the last snapshot for up to two seconds. Busy executions return cache age and refresh_deferred."}, "role": {"type": "string", "description": "Optional topology role name"},
+        "until": {"type": "string", "enum": ["running", "released"], "default": "released"},
+        "timeout_seconds": {"type": "number", "minimum": 0, "maximum": 600, "default": 30},
+        "section": {"type": "string", "enum": ["all", "sources", "preparation", "build"], "default": "all"},
+        "path": {"type": "string", "description": "Optional artifact path substring for retained profile hashes"}}),
     "vaws.finish": task_schema({"force": {"type": "boolean"}}),
     "vaws.message": task_schema({"recipient": {"type": "object", "description": "Use an existing coordination reference or reply_reference unchanged."},
                                    "text": {"type": "string", "minLength": 1, "maxLength": 4000}}, ("recipient", "text")),
 }
+TOOL_SCHEMAS["vaws.run"]["oneOf"] = [
+    {"required": ["command"], "not": {"required": ["script_file"]}},
+    {"required": ["script_file"], "not": {"required": ["command"]}},
+]
 TOOL_SCHEMAS["vaws.execution"]["oneOf"] = [
     {"required": ["execution_id"], "not": {"required": ["service"]}},
     {"required": ["service"], "not": {"required": ["execution_id"]}},
@@ -99,12 +110,13 @@ def vaws_call(name, args, *, allow_native_context=True):
             status = value["session"]["state"]
         elif name == "vaws.run":
             keys = ("command", "sources", "env", "environment", "resources", "topology",
-                    "timeout_seconds", "service", "restart", "preflight")
+                    "timeout_seconds", "service", "restart", "preflight", "script_file", "wait_until", "wait_timeout_seconds")
             value = client.run(**{key: args[key] for key in keys if key in args})
             status = value["state"]
         elif name == "vaws.execution":
             value = client.observe(args.get("execution_id"), args.get("action", "status"),
                                    args.get("force", False), role=args.get("role"), refresh=bool(args.get("refresh")),
+                                   **{key: args[key] for key in ("until", "timeout_seconds", "section", "path") if key in args},
                                    **({"service": args["service"]} if "service" in args else {}))
             status = value["state"]
         elif name == "vaws.finish":

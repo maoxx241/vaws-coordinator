@@ -36,9 +36,20 @@ import os
 import subprocess
 import sys
 import sysconfig
+import time
 
 args = json.loads(sys.argv[1])
+finalize_started = time.monotonic()
+timings = {}
 root = Path(args["root"])
+if args.get('installation_marker'):
+    import datetime
+    marker = Path(args['installation_marker'])
+    if not marker.is_relative_to(root) or marker.is_symlink() or marker.parent.is_symlink():
+        raise ValueError('installation marker escaped owned runtime')
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps({'container_identity': args['container_identity'],
+                                 'runtime_root': str(root), 'updated_at': datetime.datetime.now(datetime.timezone.utc).isoformat()}) + '\n')
 recipe = args.get("recipe")
 image_digest = args.get("image_digest")
 if not image_digest:
@@ -115,6 +126,7 @@ profile['launch_env']['PYTHONPATH'] = ':'.join([str(root / '.vaws-runtime/metada
 if args.get('source_versions'):
     profile['source_versions'] = args['source_versions']
 
+metadata_started = time.monotonic()
 capture_kernel_compile_recipe(root)
 files = installed_native_files(root)
 previous_launch_env = profile['launch_env']
@@ -124,6 +136,10 @@ upgraded_loader = profile['launch_env'] != previous_launch_env
 evidence_dir = root / ".vaws-runtime/profile-evidence"
 evidence_dir.mkdir(parents=True, exist_ok=True)
 inputs = _build_namespace["runtime_build_inputs"](root, profile, profile_key(profile))
+timings['metadata'] = time.monotonic() - metadata_started
+smoke_started = time.monotonic()
+if args.get('managed_finalize'):
+    print('finalize-runtime: native smoke/proof', file=sys.stderr, flush=True)
 if reuse.get('kind') == 'native' and reuse.get('compatibility_evidence') and not upgraded_loader:
     compatibility = json.loads(checked_file(root, reuse['compatibility_evidence']).read_text())
     smoke = {'kind': 'native-compatibility-reuse', 'python_import_executed': False,
@@ -137,6 +153,7 @@ else:
         (evidence_dir / 'smoke.json').write_text(json.dumps(smoke, indent=2) + '\n')
         raise ValueError("installed runtime import smoke failed; inspect profile-evidence/smoke.json")
 smoke['source_mapping'] = native_source_mapping(root)
+timings['native_smoke'] = time.monotonic() - smoke_started
 (evidence_dir / "smoke.json").write_text(json.dumps(smoke, indent=2) + "\n")
 (evidence_dir / "cann.json").write_text(json.dumps(profile["system_files"]["cann"], sort_keys=True) + "\n")
 (evidence_dir / "driver.json").write_text(json.dumps(profile["system_files"]["driver"], sort_keys=True) + "\n")
@@ -145,20 +162,52 @@ if toolchain:
     evidence["toolchain_log"] = toolchain["path"]
 if reuse:
     evidence['reuse'] = '.vaws-runtime/reuse.json'
+hash_started = time.monotonic()
+if args.get('managed_finalize'):
+    print('finalize-runtime: capture native hashes', file=sys.stderr, flush=True)
 manifest = capture(root, profile, inputs, files, evidence)
+timings['capture_hash'] = time.monotonic() - hash_started
 manifest['preparation'] = verified_preparation(args.get('preparation', {}), profile)
 manifest['execution_view'] = {'source_id': args.get('source_id'), 'python': sys.executable}
-verify(root, manifest)
+if args.get('managed_finalize'):
+    # The only source hashes used here were computed just above, in this owned
+    # operation after compilation and smoke. Public attest/publish still verify
+    # independently supplied native bytes. Copy destinations are always hashed.
+    proof_started = time.monotonic()
+    _verify_manifest_proof(root, manifest)
+    timings['proof_verify'] = time.monotonic() - proof_started
+else:
+    verify(root, manifest)
+cache_result = None
+if args.get('publish_native_cache'):
+    if not args.get('managed_finalize'):
+        raise ValueError('cache handoff requires the current managed capture')
+    store_started = time.monotonic()
+    print('finalize-runtime: publish native cache', file=sys.stderr, flush=True)
+    try:
+        cache_result = _store_captured_native(root, Path(SHARED_NATIVE_CACHE), manifest, timings)
+    except OSError as exc:
+        # A completed filesystem failure in this optional cache does not undo
+        # the owned runtime. Integrity/proof failures still abort finalization.
+        cache_result = {'status': 'miss', 'reason': str(exc)}
+        print('native cache publication failed: ' + str(exc), file=sys.stderr)
+    timings['cache_store'] = time.monotonic() - store_started
 marker = root / ".vaws-runtime/ready-profile.json"
 temp = marker.with_suffix(".tmp")
-temp.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
-os.replace(temp, marker)
+try:
+    temp.write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
+    os.replace(temp, marker)
+finally:
+    temp.unlink(missing_ok=True)
+timings['finalize_total'] = time.monotonic() - finalize_started
 # Preserve the complete verified bytes while avoiding repetitive path/JSON
 # overhead in stdout collection. Publication and its proof have one reply.
 import base64, zlib
 encoded_manifest = json.dumps(manifest, sort_keys=True, separators=(',', ':')).encode()
 print(json.dumps({'manifest_zlib_base64': base64.b64encode(zlib.compress(encoded_manifest)).decode('ascii'),
-                  'manifest_bytes': len(encoded_manifest), 'manifest_digest': digest(manifest)}))
+                  'manifest_bytes': len(encoded_manifest), 'manifest_digest': digest(manifest),
+                  'preparation_timings': timings, 'native_cache': cache_result,
+                  'native_smoke_executed': smoke.get('python_import_executed', True)}))
 '''
 
 

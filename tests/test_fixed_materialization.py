@@ -62,14 +62,46 @@ def peer(tmp_path, monkeypatch):
     monkeypatch.setattr(parity, 'git', transfer)
     monkeypatch.setattr(parity, 'git_remote_url', lambda endpoint, mirror: mirror)
     monkeypatch.setattr(parity, 'git_ssh_environment', lambda endpoint: os.environ.copy())
-    def run(records=None, root='runtime', *, owner='test', shared_cache=None, host=None):
+    def run(records=None, root='runtime', *, owner='test', shared_cache=None, host=None, build_source=None):
         return parity.materialize_fixed_sources(workspace_id=owner,
             endpoint={'host': 'fixture', 'port': 22, 'user': 'fixture', 'root': str(tmp_path / root)},
             source_snapshot=snapshot(records or [make_record(source, 'project')]),
             container_cache_root=str(tmp_path / 'cache'), shared_cache_root=shared_cache,
-            host_endpoint=host)
+            host_endpoint=host, build_source=build_source)
     return SimpleNamespace(source=source, commands=commands, transfers=transfers, run=run, stream=stream,
                            cache=tmp_path / 'cache', root=tmp_path / 'runtime')
+
+
+def test_build_metadata_is_written_only_by_completed_materialization(peer, monkeypatch):
+    payload = {'versions': {'project': {'version': 'fixed', 'source_head': 'admitted'}},
+               'build_env': {'FIXED_OPTION': 'yes'}}
+    observed = []
+    def stream(*args, **kwargs):
+        result = peer.stream(*args, **kwargs)
+        reply = json.loads(result.stdout)
+        marker = peer.root / '.vaws-runtime/build-source.json'
+        observed.append(reply['status'])
+        if reply['status'] == 'missing':
+            assert not marker.exists()
+        else:
+            assert json.loads(marker.read_text()) == payload
+            assert reply['build_source_seconds'] >= 0
+        return result
+    monkeypatch.setattr(parity, 'ssh_exec_stream', stream)
+    peer.run(build_source=payload)
+    assert observed == ['missing', 'materialized']
+    assert len(peer.commands) == 2
+    assert not list((peer.root / '.vaws-runtime').glob('.build-source-*'))
+
+
+def test_build_metadata_write_failure_does_not_return_success(peer):
+    peer.run()
+    marker = peer.root / '.vaws-runtime/build-source.json'
+    marker.mkdir()
+    with pytest.raises(RuntimeError):
+        peer.run(build_source={'versions': {}})
+    assert marker.is_dir()
+    assert not list(marker.parent.glob('.build-source-*'))
 
 
 def test_shared_hit_copies_only_exact_objects_to_private_owner(peer, tmp_path):

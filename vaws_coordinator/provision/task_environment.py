@@ -21,9 +21,7 @@ INSTALL_STEPS = (
     "install-vllm",
     "install-vllm-ascend-requirements",
     "install-vllm-ascend",
-    "verify-imports",
     "verify-deps",
-    "write-marker",
 )
 
 

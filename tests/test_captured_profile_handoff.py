@@ -201,13 +201,15 @@ def test_fresh_handoff_waits_for_store_and_cancellation_checks(receipt, monkeypa
     steps, cancelled = [], [False]
     def capture(*a, **k):
         steps.append('capture')
-        cancelled[0] = failure == 'capture-cancel'
+        assert k['managed_finalize'] and k['publish_native_cache']
+        assert k['process'].step == 'finalize-runtime'
+        if failure == 'store-unknown':
+            raise PreparationUncertain('unknown owned finalization during store')
+        cancelled[0] = failure in {'capture-cancel', 'store-cancel'}
         return manifest
     def cache(spec, action, *a, **k):
         steps.append(action)
-        if action == 'store':
-            if failure == 'store-unknown': raise PreparationUncertain('unknown owned store')
-            cancelled[0] = failure == 'store-cancel'
+        assert action != 'store', 'publication belongs to the same owned finalization'
         return {'status': 'miss'}
     monkeypatch.setattr(backend, '_write_ready_profile', capture)
     monkeypatch.setattr(backend, '_shared_native', cache)
@@ -216,8 +218,8 @@ def test_fresh_handoff_waits_for_store_and_cancellation_checks(receipt, monkeypa
             source_snapshot=snapshot, on_preparation_job=lambda record: None, cancel_requested=lambda: cancelled[0])
     if failure:
         with pytest.raises(PreparationUncertain if failure == 'store-unknown' else PreparationCancelled): run()
-        assert steps == (['restore', 'capture'] if failure == 'capture-cancel' else ['restore', 'capture', 'store'])
+        assert steps == ['restore', 'capture']
     else:
         result = run()
         assert isinstance(result, adapters.PreparedNativeView) and result.attestation is manifest
-        assert steps == ['restore', 'capture', 'store']
+        assert steps == ['restore', 'capture']

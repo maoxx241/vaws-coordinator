@@ -51,21 +51,29 @@ def main():
         child.add_argument("--context-file")
         child.add_argument("--full", action="store_true", default=None)
         child.add_argument("--json", default="{}", help="Additional structured tool arguments")
+        if name in {"run", "execution"}:
+            child.add_argument("--wait", dest="wait_until", choices=["running", "released"],
+                               help="Owner-side wait; timeout retains the same execution and does not stop it")
+            child.add_argument("--wait-timeout-seconds", type=float, help="Observation budget, 0-600 seconds (default 30)")
         if name == "run":
-            child.add_argument("--command", required=True)
+            command = child.add_mutually_exclusive_group()
+            command.add_argument("--command")
+            command.add_argument("--script-file", help="Capture a local UTF-8 shell file directly; no runner needed")
             sources = child.add_mutually_exclusive_group()
             sources.add_argument("--source", action="append", metavar="NAME=PATH",
                                  help="Capture an actual worktree for this submission; repeat for multiple repositories")
             sources.add_argument("--no-sources", action="store_true", default=None,
                                  help="Run without source dependencies, ignoring task defaults")
             child.add_argument("--service", default=None)
-            child.add_argument("--restart", action="store_true")
+            child.add_argument("--restart", action="store_true", default=None)
             child.add_argument("--timeout-seconds", type=int)
         if name == "execution":
             reference = child.add_mutually_exclusive_group()
             reference.add_argument("--execution-id")
             reference.add_argument("--service")
-            child.add_argument("--action", choices=["status", "tail", "stop", "target"])
+            child.add_argument("--action", choices=["status", "wait", "evidence", "tail", "stop", "target"])
+            child.add_argument("--section", choices=["all", "sources", "preparation", "build"])
+            child.add_argument("--path", help="Artifact path substring for evidence")
             child.add_argument("--role", default=None)
             child.add_argument("--refresh", action="store_true", default=None,
                                help="Refresh remote status; otherwise reuse a snapshot for up to two seconds")
@@ -89,6 +97,16 @@ def main():
     # Unset argparse defaults (None) must not silently override --json keys:
     # `--json '{"action":"stop"}'` degraded to a status query otherwise.
     merged = {**extra, **{key: value for key, value in args.items() if value is not None}}
+    if operation == "execution":
+        if "wait_until" in merged:
+            if merged.get("action", "wait") != "wait":
+                print(json.dumps(error_payload("vaws.execution", outcome="needs_input", status="invalid_wait",
+                                               error="--wait requires action=wait"), ensure_ascii=False))
+                return 1
+            merged["action"] = "wait"
+            merged["until"] = merged.pop("wait_until")
+        if "wait_timeout_seconds" in merged:
+            merged["timeout_seconds"] = merged.pop("wait_timeout_seconds")
     if operation == "run":
         selected = merged.pop("source", None)
         no_sources = merged.pop("no_sources", None)

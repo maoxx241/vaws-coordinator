@@ -609,6 +609,20 @@ def verify_execution_view(root: Path, manifest: dict[str, Any]) -> None:
 
 
 def verify(root: Path, manifest: dict[str, Any], *, check_environment: bool = True) -> None:
+    """Validate independently supplied bytes and their complete runtime proof."""
+    if manifest.get('schema_version') == 1:
+        for name, row in manifest['files'].items():
+            if file_digest(checked_file(root, name)) != row['sha256']:
+                raise ValueError(f'artifact hash mismatch: {name}')
+    _verify_manifest_proof(root, manifest, check_environment=check_environment)
+
+
+def _verify_manifest_proof(root: Path, manifest: dict[str, Any], *, check_environment: bool = True) -> None:
+    """Validate identity/evidence, separately from reading native output bytes.
+
+    Only a capture in this function stack may reuse its freshly computed file
+    hashes. Public verification always reads those files before entering here.
+    """
     if manifest.get('schema_version') == 2 and manifest.get('profile', {}).get('kind') == 'command':
         if profile_key(manifest['profile']) != manifest['profile_key']:
             raise ValueError('command environment identity mismatch')
@@ -626,9 +640,6 @@ def verify(root: Path, manifest: dict[str, Any], *, check_environment: bool = Tr
         raise ValueError("incomplete native bundle")
     if not {"cann", "driver", "smoke"}.issubset(manifest["evidence"]):
         raise ValueError("missing environment evidence")
-    for name, row in manifest["files"].items():
-        if file_digest(checked_file(root, name)) != row["sha256"]:
-            raise ValueError(f"artifact hash mismatch: {name}")
     for row in manifest["evidence"].values():
         if file_digest(checked_file(root, row["path"])) != row["sha256"]:
             raise ValueError("environment evidence changed")
@@ -651,6 +662,17 @@ def verify(root: Path, manifest: dict[str, Any], *, check_environment: bool = Tr
 def publish(root: Path, cache: Path, manifest: dict[str, Any]) -> Path:
     """Atomically publish a complete, immutable bundle; no partial cache hits."""
     verify(root, manifest)
+    return _publish_captured_bundle(root, cache, manifest)
+
+
+def _publish_captured_bundle(root: Path, cache: Path, manifest: dict[str, Any], *, timings=None) -> Path:
+    """Publish bytes whose source hashes were captured in this operation.
+
+    Copy destination verification is mandatory, including an existing bundle.
+    This private boundary is never exposed as a caller-selected verified flag.
+    """
+    import time
+    timings = timings if timings is not None else {}
     cache.mkdir(parents=True, exist_ok=True)
     destination = cache / manifest["build_key"]
     if destination.exists():
@@ -660,20 +682,37 @@ def publish(root: Path, cache: Path, manifest: dict[str, Any]) -> Path:
         identity_fields = ("schema_version", "profile", "profile_key", "build_inputs", "build_key", "runtime_root", "files")
         if any(existing.get(key) != manifest.get(key) for key in identity_fields):
             raise ValueError("same build inputs produced different artifacts; inspect reproducibility")
+        started = time.monotonic()
         verify(destination, existing, check_environment=False)
+        timings['bundle_verify'] = time.monotonic() - started
         return destination
     temp = Path(tempfile.mkdtemp(prefix=".publish-", dir=cache))
     try:
         names = set(manifest["files"]) | {row["path"] for row in manifest["evidence"].values()}
         if "manifest.json" in names:
             raise ValueError("reserved bundle path: manifest.json")
+        started = time.monotonic()
         for name in names:
             target = temp / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(checked_file(root, name), target)
+        timings['bundle_copy'] = time.monotonic() - started
         (temp / "manifest.json").write_text(json.dumps(manifest, sort_keys=True, indent=2) + "\n")
+        started = time.monotonic()
         verify(temp, manifest, check_environment=False)
-        os.rename(temp, destination)
+        timings['bundle_verify'] = time.monotonic() - started
+        try:
+            os.rename(temp, destination)
+        except OSError:
+            # Another complete publication may win this immutable key. Never
+            # replace it or mistake a failed/partial destination for success.
+            if not destination.is_dir():
+                raise
+            existing = json.loads((destination / 'manifest.json').read_text())
+            identity_fields = ('schema_version', 'profile', 'profile_key', 'build_inputs', 'build_key', 'runtime_root', 'files')
+            if any(existing.get(key) != manifest.get(key) for key in identity_fields):
+                raise ValueError('concurrent publication produced different artifacts')
+            verify(destination, existing, check_environment=False)
         return destination
     finally:
         if temp.exists():
