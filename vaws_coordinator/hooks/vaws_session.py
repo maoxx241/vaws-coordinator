@@ -93,7 +93,7 @@ def in_project_scope(cwd: Path, project: Path, *, sources: dict[str, str] | None
         try:
             actual = subprocess.run(
                 ["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
-                capture_output=True, text=True, encoding="utf-8", timeout=5, check=True,
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", timeout=5, check=True,
             ).stdout.strip()
             if Path(client_path(actual)).resolve() in {Path(client_path(path)).resolve() for path in sources.values()}:
                 return True
@@ -114,7 +114,7 @@ def in_project_scope(cwd: Path, project: Path, *, sources: dict[str, str] | None
             # nested clone has no superproject and must not inherit its hooks.
             parent = subprocess.run(
                 ["git", "-C", str(current), "rev-parse", "--show-superproject-working-tree"],
-                capture_output=True, text=True, encoding="utf-8", timeout=5, check=True,
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", timeout=5, check=True,
             ).stdout.strip()
             if not parent:
                 return False

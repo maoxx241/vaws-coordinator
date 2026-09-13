@@ -83,6 +83,7 @@ def run(
     check: bool = True,
     capture_output: bool = True,
     timeout: float | None = None,
+    stdin: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
     try:
         result = subprocess.run(
@@ -93,6 +94,7 @@ def run(
             capture_output=capture_output,
             text=True, encoding="utf-8",
             timeout=timeout,
+            stdin=stdin,
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(
@@ -119,7 +121,8 @@ def git(
     timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     options = ['-c', 'core.longpaths=true'] if os.name == 'nt' else []
-    return run(['git', *options, '-C', str(repo), *args], env=env, check=check, timeout=timeout)
+    return run(['git', *options, '-C', str(repo), *args], env=env, check=check, timeout=timeout,
+               stdin=subprocess.DEVNULL)
 
 
 def repo_root_from(path: Path) -> Path:

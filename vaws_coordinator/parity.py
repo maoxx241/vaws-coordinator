@@ -370,7 +370,7 @@ def _clean_head_snapshot_base(record):
                 raise TimeoutError('optional clean snapshot hint exceeded its budget')
             return subprocess.run(
                 ['git', '--no-replace-objects', '-C', record.source_path, *args],
-                input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                input=data if data is not None else b'', stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 check=True, timeout=remaining, env=env,
             ).stdout
 
