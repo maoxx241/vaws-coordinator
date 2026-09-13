@@ -96,7 +96,8 @@ def test_export_interruption_is_not_an_ordinary_cache_miss(monkeypatch, failure)
     from vaws_coordinator.preparation_process import PreparationCancelled, PreparationUncertain
     backend = RemoteBackend()
     spec = {'container_name': 'vaws-recipient', 'host_endpoint': {'host': 'host', 'port': 22, 'user': 'root'}}
-    monkeypatch.setattr(backend, 'bash', lambda *args: '"sha256:same"')
+    monkeypatch.setattr(backend, 'bash', lambda *args: json.dumps({
+        'Id': 'recipient-generation', 'Image': 'sha256:same', 'State': {'Running': True}}))
     result = {'status': 'failed', 'remote_outcome': 'unknown'} if failure == 'remote-unknown' else {'status': failure}
     monkeypatch.setattr('remote_dev.core.ssh_transport.run_remote_python', lambda *args, **kwargs: result)
     with pytest.raises(PreparationCancelled if failure == 'cancelled' else PreparationUncertain):
