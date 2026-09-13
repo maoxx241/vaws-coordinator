@@ -303,8 +303,7 @@ else:
     print(json.dumps(manifest))
 '''
         view = runtime['endpoint'].get('cwd') or runtime['endpoint']['root']
-        # Interpreter metadata must resolve the execution view's overlay too.
-        prefix = 'export PYTHONPATH=' + shlex.quote(':'.join([view + '/.vaws-runtime/metadata', view + '/vllm', view + '/vllm-ascend'])) + '"${PYTHONPATH:+:$PYTHONPATH}"\n'
+        prefix = self._probe_preamble(runtime, view)
         command = (prefix + shlex.quote(python) + " - " + shlex.quote(request)
                    + " <<'VAWS_READY_PROBE'\n" + module + runner + "\nVAWS_READY_PROBE\n")
         return json.loads(self.bash(runtime["endpoint"], command))
@@ -347,10 +346,19 @@ for row in args['records']:
 print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'manifest': manifest} if args.get('include_manifest') else {})}))
 '''
         root = runtime['endpoint']['root']
-        prefix = 'export PYTHONPATH=' + shlex.quote(':'.join([root + '/.vaws-runtime/metadata', root + '/vllm', root + '/vllm-ascend'])) + '"${PYTHONPATH:+:$PYTHONPATH}"'
+        prefix = self._probe_preamble(runtime, root)
         script = prefix + '\n' + shlex.quote(runtime['python']) + ' - ' + shlex.quote(json.dumps(request))
         script += " <<'VAWS_QUALIFY'\n" + module + runner + '\nVAWS_QUALIFY\n'
         return json.loads(self.bash(runtime['endpoint'], script))
+
+    @staticmethod
+    def _probe_preamble(runtime, root):
+        # Metadata in image/CANN paths must resolve in the same environment
+        # used by the captured proof and actual launch, before Python starts.
+        profile = (runtime.get('attestation') or {}).get('profile') or runtime.get('profile')
+        prefix = launch_preamble(profile, python=runtime.get('python')) + '\n' if profile else ''
+        return prefix + 'export PYTHONPATH=' + shlex.quote(':'.join([
+            root + '/.vaws-runtime/metadata', root + '/vllm', root + '/vllm-ascend'])) + '"${PYTHONPATH:+:$PYTHONPATH}"\n'
 
     def command_environment(self, donor):
         """Resolve the real image interpreter without building an environment."""
