@@ -28,7 +28,7 @@ def run(script, cwd=None):
     with tempfile.TemporaryFile() as source:
         source.write(script.encode('utf-8'))
         source.seek(0)
-        result = subprocess.run(['bash', '/proc/self/fd/' + str(source.fileno())],
+        result = subprocess.run(['bash', '/dev/fd/' + str(source.fileno())],
                                 pass_fds=(source.fileno(),), cwd=cwd)
     if result.returncode:
         raise SystemExit(result.returncode if result.returncode > 0 else 128 - result.returncode)

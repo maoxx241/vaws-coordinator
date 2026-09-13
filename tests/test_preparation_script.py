@@ -19,7 +19,7 @@ def test_large_composite_program_fits_without_splitting_jobs():
     assert not preparation_command_fits(os.urandom(100000).hex())
 
 
-@pytest.mark.skipif(sys.platform != 'linux', reason='owned preparation runs on Linux')
+@pytest.mark.skipif(sys.platform not in ('linux', 'darwin'), reason='requires POSIX descriptor paths')
 @pytest.mark.parametrize('code', [0, 17])
 def test_large_program_preserves_cwd_stdin_output_and_exit(tmp_path, code):
     script = '# package program\n' * 16000 + '\nprintf "%s\\n" "$PWD"\ncat\nexit ' + str(code)
