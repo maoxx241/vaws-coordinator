@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -289,9 +290,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.describe:
         print(json.dumps(describe(), ensure_ascii=False, indent=2))
         return 0
-    reader, writer = sys.stdin.buffer, sys.stdout.buffer
+    writer = sys.stdout.buffer
     sys.stdout = sys.stderr
-    return serve(reader, writer)
+    # Reserve the protocol pipe for this reader before any read or worker
+    # starts. Children (including third-party Git/version helpers) must not
+    # inherit RPC stdin: on Windows, their startup can block behind its read.
+    # os.dup creates a non-inheritable descriptor; dup2 also updates Windows'
+    # standard-input handle. Explicit subprocess input still uses its own pipe.
+    with os.fdopen(os.dup(sys.stdin.fileno()), "rb") as reader:
+        with open(os.devnull, "rb") as empty:
+            os.dup2(empty.fileno(), sys.stdin.fileno())
+        return serve(reader, writer)
 
 
 if __name__ == "__main__":

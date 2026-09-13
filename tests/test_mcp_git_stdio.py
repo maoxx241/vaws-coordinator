@@ -13,6 +13,8 @@ from vaws_coordinator.agent_session import AgentSessions
 def test_worker_binds_and_captures_sources_while_mcp_reader_waits(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
+    (repo / "pyproject.toml").write_text(
+        '[project]\nname="fixture"\ndynamic=["version"]\n', encoding="utf-8")
     (repo / "kernel.cpp").write_text("base\n", encoding="utf-8")
     for args in (["init"], ["config", "user.name", "Test"],
                  ["config", "user.email", "test@example.invalid"],
@@ -31,6 +33,11 @@ def test_worker_binds_and_captures_sources_while_mcp_reader_waits(tmp_path):
 from vaws_coordinator.task_client import TaskClient
 from vaws_coordinator.task_server import main
 def offline(self):
+    import subprocess, sys
+    echo = [sys.executable, '-c', 'import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())']
+    assert subprocess.run(echo, capture_output=True, check=True, timeout=5).stdout == b''
+    assert subprocess.run(echo, input=b'explicit input', capture_output=True,
+                          check=True, timeout=5).stdout == b'explicit input'
     raise RuntimeError('captured inputs; admission disabled by test')
 TaskClient.coordinator = property(offline)
 raise SystemExit(main())
@@ -64,6 +71,7 @@ raise SystemExit(main())
         record = snapshot["records"][0]
         assert record["changed_paths"] == ["kernel.cpp"]
         assert record["build_inputs"]["native"]
+        assert record["scm_version"]
         assert rpc(4, "ping")["result"] == {}
     finally:
         # EOF also releases an inherited Git input pipe on the failing version.
