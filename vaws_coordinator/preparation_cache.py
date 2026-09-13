@@ -349,6 +349,13 @@ def restore_shared_native(root: Path, cache: Path, preparation: dict, image_dige
         marker.write_text(json.dumps(receipt))
         reuse = {'kind': 'shared-native', 'native_key': expected['native_key'],
                  'soc': profile['soc'], 'compiler': profile['compiler']}
+        compatibility = native_import_receipt(bundle, manifest)
+        if compatibility is not None:
+            relative = '.vaws-runtime/profile-evidence/import-closure.json'
+            proof = safe_destination(root, relative)
+            proof.parent.mkdir(parents=True, exist_ok=True)
+            proof.write_text(json.dumps(compatibility, sort_keys=True) + '\n')
+            reuse['import_evidence'] = relative
         atb = re.search(r'/cxx_abi_([01])/?$', profile.get('launch_env', {}).get('ATB_HOME_PATH', ''))
         if atb:
             # This comes from the verified donor's real ATB activation. The

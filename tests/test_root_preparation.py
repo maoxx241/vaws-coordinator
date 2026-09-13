@@ -92,20 +92,14 @@ def test_root_cancellation_stops_before_any_next_step(preparation, monkeypatch, 
     assert not preparation.finished
 
 
-def test_cold_venv_still_has_owned_process_after_root_bootstrap(preparation, monkeypatch):
-    order = []
-    def rpc(*args, **kwargs):
-        order.append('root-created')
-        return RemoteCompleted(0, '', '')
-    def owned(endpoint, script, **kwargs):
-        assert order == ['root-created']
-        process = kwargs['process']
-        assert isinstance(process, PreparationProcess)
-        assert process.endpoint == preparation.endpoint
-        assert process.step == 'create-venv'
-        order.append('owned-venv')
-    monkeypatch.setattr('remote_dev.core.ssh_transport.run_rpc_script', rpc)
-    monkeypatch.setattr('vaws_coordinator.parity_support.ssh_exec_stream', owned)
+def test_cold_venv_setup_is_carried_by_first_owned_job(preparation, monkeypatch):
+    monkeypatch.setattr('remote_dev.core.ssh_transport.run_rpc_script',
+                        lambda *a, **k: pytest.fail('managed setup must share its first owned job'))
+    monkeypatch.setattr('vaws_coordinator.parity_support.ssh_exec_stream',
+                        lambda *a, **k: pytest.fail('no separate venv job'))
     preparation.run(donor_python=None, on_preparation_job=lambda job: None)
-    assert order == ['root-created', 'owned-venv']
     assert len(preparation.finished) == 1
+    process = preparation.finished[0]['process']
+    assert isinstance(process, PreparationProcess) and process.endpoint == preparation.endpoint
+    assert [name for name, _script in process.setup] == ['prepare-root', 'create-venv']
+    assert process.step == 'finalize-runtime'

@@ -126,6 +126,7 @@ def prepare_task_environment(
     on_preparation_job=None,
     cancel_requested=None,
     checkout_session=None,
+    compile_scope=None,
 ) -> dict[str, Any]:
     """Create an isolated task root, install into a task-owned interpreter, register.
 
@@ -266,6 +267,7 @@ def prepare_task_environment(
         workspace_root=str(Path(next(iter(sources.values()))).resolve().parent) if sources else None,
         on_progress=on_progress, log_dir=log_dir,
         on_preparation_job=on_preparation_job, cancel_requested=cancel_requested,
+        **({"compile_scope": compile_scope} if compile_scope is not None else {}),
     )
     if checkout_session:
         from vaws_coordinator.backend import PreparedNativeView

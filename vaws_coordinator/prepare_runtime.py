@@ -111,6 +111,7 @@ profile = {
     "compiler": compiler,
     "build_env": dict(args.get('build_env') or {}),
     "launch_env": {},
+    **installed_dependency_identity(),
     "compatibility_evidence": ".vaws-runtime/profile-evidence/smoke.json",
     "system_files": {
         "cann": {"path": str(cann_file), "sha256": file_digest(cann_file)},
@@ -146,10 +147,20 @@ if reuse.get('kind') == 'native' and reuse.get('compatibility_evidence') and not
              'profile_key': profile_key(profile), 'build_inputs': inputs,
              'compatibility': compatibility, 'source_mapping': native_source_mapping(root)}
 else:
-    smoke = native_import_smoke(root, profile, inputs)
+    compatibility = (json.loads(checked_file(root, reuse['import_evidence']).read_text())
+                     if reuse.get('import_evidence') else None)
+    candidate = {'runtime_root': str(root), 'profile': profile, 'build_inputs': inputs,
+                 'files': {name: {'sha256': file_digest(checked_file(root, name)), 'role': role}
+                           for name, role in files.items()}} if compatibility else None
+    if compatibility and compatibility['key'] == native_import_closure_key(candidate):
+        smoke = {'kind': 'native-import-closure-reuse', 'python_import_executed': False,
+                 'profile_key': profile_key(profile), 'build_inputs': inputs,
+                 'compatibility': compatibility, 'source_mapping': native_source_mapping(root)}
+    else:
+        smoke = native_import_smoke(root, profile, inputs)
     if upgraded_loader and reuse.get('compatibility_evidence'):
         smoke['reason'] = 'native-loader-environment-upgrade'
-    if not smoke['passed']:
+    if smoke.get('python_import_executed') is not False and not smoke['passed']:
         (evidence_dir / 'smoke.json').write_text(json.dumps(smoke, indent=2) + '\n')
         raise ValueError("installed runtime import smoke failed; inspect profile-evidence/smoke.json")
 smoke['source_mapping'] = native_source_mapping(root)

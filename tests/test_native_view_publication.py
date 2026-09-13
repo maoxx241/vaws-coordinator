@@ -298,6 +298,7 @@ def test_hot_preparation_has_one_publication_and_no_separate_capture(monkeypatch
         assert kwargs['source_snapshot'] is snapshot
         assert kwargs['endpoint'] is spec['endpoint']
         assert isinstance(kwargs['process'], PreparationProcess)
+        assert kwargs['process'].setup[0][0] == 'prepare-root'
         assert kwargs['native_publication'] is publication
         seen.append('materialize')
         if mode == 'uncertain':
@@ -329,12 +330,12 @@ def test_hot_preparation_has_one_publication_and_no_separate_capture(monkeypatch
         from vaws_coordinator.preparation_process import PreparationUncertain
         with pytest.raises(PreparationUncertain):
             prepare()
-        assert seen == ['prepare-root', 'materialize']
+        assert seen == ['materialize']
         return
     result = prepare()
     assert isinstance(result, adapters.PreparedNativeView) and result.attestation is published
-    assert seen == (['prepare-root', 'materialize'] if mode == 'combined' else ['prepare-root', 'materialize', 'publish'])
-    assert progress == (['prepare-root', 'materialize'] if mode == 'combined' else ['prepare-root', 'materialize', 'publish-native-view'])
+    assert seen == (['materialize'] if mode == 'combined' else ['materialize', 'publish'])
+    assert progress == (['materialize'] if mode == 'combined' else ['materialize', 'publish-native-view'])
 
 
 @pytest.mark.parametrize('uncertain', [False, True])

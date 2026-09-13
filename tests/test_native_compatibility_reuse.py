@@ -17,6 +17,7 @@ from vaws_coordinator.prepare_runtime import REMOTE_CAPTURE_SUFFIX
 
 @pytest.fixture
 def prepared(tmp_path, monkeypatch):
+    monkeypatch.setattr(profile, 'installed_dependency_identity', lambda: {})
     original, view = tmp_path / 'original', tmp_path / 'view'
     extension = 'vllm-ascend/vllm_ascend/vllm_ascend_C' + importlib.machinery.EXTENSION_SUFFIXES[0]
     files = {extension: 'library', 'vllm-ascend/vllm_ascend/_cann_ops_custom/config.json': 'metadata'}

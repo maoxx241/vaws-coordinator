@@ -845,22 +845,14 @@ class CoordinatorService(TaskMessages):
 
         def prepare(placement):
             role, donor = placement
-            # CPU preparation never holds NPU leases. Across concurrent task
-            # groups, one host prepares at a time; independent hosts proceed.
-            host = host_key(donor)
-            lock = self._lock_for("prepare-host", host)
-            while not lock.acquire(timeout=0.1):
-                if self._adopt_cancel(store, row):
-                    return None
+            # Private roots and immutable cache reads can prepare concurrently.
+            # Only actual compiler stages share the host CPU budget below.
+            if self._adopt_cancel(store, row):
+                return None
             try:
-                if self._adopt_cancel(store, row):
-                    return None
-                try:
-                    return self._prepare_role(store, user, row, role, environment, donor)
-                except PreparationCancelled:
-                    return None
-            finally:
-                lock.release()
+                return self._prepare_role(store, user, row, role, environment, donor)
+            except PreparationCancelled:
+                return None
 
         try:
             if len(placements) == 1:
@@ -1024,6 +1016,24 @@ class CoordinatorService(TaskMessages):
 
     def _prepare_role(self, store, user, row, role, environment, donor):
         from vaws_coordinator.provision import prepare_task_environment
+        from contextlib import contextmanager
+        @contextmanager
+        def compile_scope(step):
+            # Each compiler already bounds its internal parallel variants. One
+            # compiler per host avoids multiplying that whole-machine budget.
+            lock = self._lock_for('compile-host', host_key(donor))
+            started = time.monotonic()
+            while not lock.acquire(timeout=0.1):
+                if self._adopt_cancel(store, row):
+                    raise PreparationCancelled('cancelled while waiting for the host compiler')
+            try:
+                if self._adopt_cancel(store, row):
+                    raise PreparationCancelled('cancelled before compilation')
+                self._save_progress(store, row, role['name'], {'step': step,
+                    'compile_wait_seconds': round(time.monotonic() - started, 6)})
+                yield
+            finally:
+                lock.release()
         prepared = prepare_task_environment(
             self.pool, user=user, session_id=row["id"], role_name=role["name"],
             environment=environment, donor=donor, sources=row.get("sources") or {},
@@ -1033,6 +1043,7 @@ class CoordinatorService(TaskMessages):
             on_preparation_job=lambda job: self._save_preparation_job(store, row, role["name"], job),
             cancel_requested=lambda: self._adopt_cancel(store, row),
             checkout_session=row["remote_session"]["id"],
+            compile_scope=compile_scope,
         )
         # Each finished role remains recoverable while its siblings prepare.
         # A crash before this save is also covered by the pool's durable
@@ -1362,7 +1373,7 @@ class CoordinatorService(TaskMessages):
             evidence["preparation"] = {"stages": row.get("stage_history", []),
                 "current": row.get("role_progress") or row.get("progress"),
                 "phase_observed_at": row.get("phase_observed_at", {}),
-                "jobs": [{"name": name, **{key: job[key] for key in ("step", "state", "quiet", "job_id", "observed_at") if key in job}}
+                "jobs": [{"name": name, **{key: job[key] for key in ("step", "state", "quiet", "job_id", "observed_at", "stage_timings", "elapsed_seconds") if key in job}}
                          for name, jobs in row.get("preparation_jobs", {}).items() if role is None or role == name
                          for job in jobs.values()]}
         if section in {"all", "preparation", "build"}:
@@ -1678,7 +1689,7 @@ class CoordinatorService(TaskMessages):
         # standalone jobs and free roles of busy executions. One stalled host
         # must not consume healthy siblings' renewal budget while their shared
         # execution worker remains busy. Per-job locks prevent overlap.
-        self.pool.tick(exclude_managed=execution_jobs)
+        self.pool.tick(exclude_managed=execution_jobs, background=True)
         for directory, store, executions in sessions:
             finishing = {session["id"] for session in store.sessions() if session.get("state") == "finishing"}
             for row in executions:
@@ -1709,6 +1720,17 @@ class CoordinatorService(TaskMessages):
                 self._record_daemon_error(f"execution {row.get('id')}: {exc}; persist {record_exc}")
         finally:
             lock.release()
+        if self._async_progress:
+            try:
+                store = self.store(directory)
+                with store.transaction() as db:
+                    current = store.get(db, 'execution', row['id'])
+                for role in current.get('roles', []):
+                    if role.get('managed_job') and (role.get('observation') or {}).get('state') == 'running':
+                        self.pool.watch_completion(role['managed_job'],
+                            lambda _job: self.advance(directory, row.get('user') or '', row['id'], action='progress'), self._stopped)
+            except Exception as exc:
+                self._record_daemon_error('completion observer: ' + str(exc))
 
     def _serve_conn(self, conn: socket.socket) -> None:
         conn.settimeout(CLIENT_TIMEOUT_SECONDS)

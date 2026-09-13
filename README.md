@@ -187,9 +187,11 @@ response-generation time, not proof of a new remote query.
 `refresh=False` to read the nonblocking status cache. `TaskClient.wait()` uses one
 owner RPC with condition notifications, with no execution lock held while waiting.
 MCP wait and control requests use separate worker pools, keeping stop and ping
-responsive. Remote completion detection still follows the existing two-second
-supervision cadence plus remote IO; notifications remove an additional client
-polling interval, not that remote sampling delay. Tail, target, stop, resource
+responsive. Running jobs also use the existing remote owned-job bounded wait
+on an independent observer; a terminal quiet receipt immediately advances fenced
+release without waiting for the next two-second supervision tick. Lease renewal
+and lost-wait recovery keep that normal supervision cadence. Waiters hold no
+control locks and cannot replay commands. Tail, target, stop, resource
 allocation and background progression retain their existing behavior. Cached
 observations neither allocate resources nor establish new ownership. A busy
 execution returns its stored observation immediately and explicitly marks a
@@ -285,8 +287,7 @@ path. This prevents repository directories
 in the task cwd from shadowing editable packages, while preserving the CANN
 and other support paths already supplied by the environment.
 
-The first native environment and rebuilt outputs receive a full framework
-import smoke. A fresh Python source view can reuse that original evidence when
+The first native environment receives a full framework import smoke. A fresh Python source view can reuse that original evidence when
 its dependency/native inputs, loader environment and complete artifact hashes
 match; preparation checks the current module and SCM metadata mappings without
 importing the changed business code. Its receipt explicitly records
@@ -301,8 +302,12 @@ hashes, source/SCM mappings are updated, and the original import proof is carrie
 forward. Its completed receipt goes directly into an atomic managed binding.
 There is no second profile capture, full registration probe, or SSH reservation.
 Fresh native builds and shared/incremental restores also hand their completed
-capture directly to managed registration. The capture still runs the required
-import, hashes the full bundle, verifies its environment and atomically writes
+capture directly to managed registration. A shared restore can reuse import
+evidence only when captured non-compiler source/resources, resolved dependency
+versions and locations, CPU libraries, generated build metadata and loader paths
+match. Device kernel outputs and dispatch are still validated after compilation;
+the complete bundle is still hashed. Missing older import-closure evidence takes
+the normal import path. The capture verifies its environment and atomically writes
 the marker; its compressed reply retains every file identity. The handoff checks
 the exact execution root, interpreter, source identity and observed image and
 container, and waits for any owned cache store and cancellation check. Launch
@@ -406,7 +411,10 @@ families and requires verified quiet before reporting cancellation or release;
 an unknown transport or ownership outcome remains uncertain. A restarted daemon
 can observe and stop these retained jobs without replaying preparation or
 replacing sources beneath a compiler. Queued preparation can cancel while
-another execution holds the host's preparation lock. Tail includes the current
+another execution holds the host's compiler budget. Private source preparation
+and cache reads proceed concurrently; one compiler per host retains the recipe's
+existing internal parallelism. Shared filesystem writes use their narrow locks
+or atomic publication. Slow standalone pool jobs dispatch independently. Tail includes the current
 local preparation log. Fixed source materialization runs as an owned preparation
 job with bounded upload/command deadlines and cancellation support.
 Completed build-compatibility failures end preparation before editable installs
@@ -436,9 +444,14 @@ Uncertain jobs are observed, never replayed. Runtime compatibility, native
 build checks and resource allocation still run. Host coordination uses the
 remote-dev Python RPC code cache, sending only the request after the first call.
 
-Short root preparation reuses that endpoint's Python RPC connection; owned
-preparation jobs wait for exit within their bounded polling interval instead
-of returning early merely because output arrived. First admission persists
+The first owned preparation job starts from the existing container workspace
+and creates its execution root and venv before materialization. Large composed
+programs use a digest-checked compressed bootstrap within the command budget, so
+embedded package code does not force a separate publication job. Uncompressible
+inputs retain a bounded transfer fallback. Preparation job evidence records the
+combined local elapsed time and individual remote setup durations; these use
+separate clock domains and must not be subtracted from each other. Owned jobs
+wait for exit within their bounded yield rather than returning early on output. First admission persists
 the observed host epoch before submitting and acquiring in one host exchange.
 New managed runs read their exact task and container facts together, verify the
 compact source/environment view, then reuse a newly issued grant's occupancy

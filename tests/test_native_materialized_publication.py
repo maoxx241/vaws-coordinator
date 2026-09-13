@@ -68,7 +68,8 @@ def materialize_program(request):
 @pytest.mark.parametrize('missing', [False, True])
 def test_actual_bash_argument_composes_materialization_and_fixed_native_proof(donor, missing):
     publication, request = fixed_plan(donor, missing=missing)
-    command = publication.wrap_program(materialize_program(request))
+    from vaws_coordinator.preparation_script import preparation_command
+    command = preparation_command(publication.wrap_program(materialize_program(request)))
     size = len(command.encode('utf-8'))
     assert size <= 96 * 1024
     completed = subprocess.run(['/bin/bash', '-c', command], capture_output=True, text=True)
@@ -99,7 +100,7 @@ def test_failed_native_publication_never_returns_a_materialized_only_success(don
     assert not completed.stdout.strip()
 
 
-@pytest.mark.parametrize('edit_bytes', [0, 64, 24000])
+@pytest.mark.parametrize('edit_bytes', [0, 64, 24000, 100000])
 def test_real_materializer_api_budgets_native_modules_and_inline_git_pack(donor, monkeypatch, edit_bytes):
     from test_fixed_materialization import make_record, snapshot
     publication, request = fixed_plan(donor)
@@ -138,7 +139,7 @@ def test_real_materializer_api_budgets_native_modules_and_inline_git_pack(donor,
         native_publication=publication, container_cache_root=str(source.parent / 'cache'))
     assert publication.accept(result['native_view'])['execution_view']['source_id'] == fixed['id']
     assert len(commands) == (2 if edit_bytes else 1)
-    assert len(pushes) == (1 if edit_bytes == 24000 else 0)
+    assert len(pushes) == (1 if edit_bytes == 100000 else 0)
     if edit_bytes:
         assert (Path(request['root']) / 'vllm/data.bin').read_bytes() == (source / 'vllm/data.bin').read_bytes()
     print(json.dumps({'edit_bytes': edit_bytes, 'command_bytes': [len(row.encode('utf-8')) for row in commands],
@@ -146,7 +147,7 @@ def test_real_materializer_api_budgets_native_modules_and_inline_git_pack(donor,
 
 
 def test_materializer_accounts_for_entire_composite_before_inline_pack(monkeypatch, tmp_path):
-    """Oversized no-pack composition retains the original two-job path."""
+    """Incompressible over-budget composition retains the two-job fallback."""
     from test_fixed_materialization import make_record, snapshot
     if sys.platform != 'linux':
         pytest.skip('actual Git peer runs under Linux')
@@ -161,9 +162,10 @@ def test_materializer_accounts_for_entire_composite_before_inline_pack(monkeypat
     record = make_record(source, 'project')
     fixed = snapshot([record])
     commands = []
+    oversized = os.urandom(100000).hex()
     class OversizedPublication:
         def wrap_program(self, program):
-            return 'x' * (96 * 1024 + 1)
+            return oversized
     def stream(endpoint, command, **kwargs):
         commands.append(command)
         assert len(command.encode()) < 96 * 1024 and command != 'x' * len(command)
@@ -204,23 +206,20 @@ def test_backend_prepares_missing_root_before_real_owned_worker_launch_and_quiet
     with pytest.raises(FileNotFoundError):
         control_job({'root': str(root), 'job_id': 'absent-root', 'action': 'status'}, worker)
 
-    def rpc(endpoint, command, **kwargs):
-        assert not root.exists() and not saved
-        actions.append('prepare-root-rpc')
-        # Disable only image hostname repair; this local test must not edit
-        # /etc/hosts. Run the actual package root filesystem script unchanged.
-        result = subprocess.run(['/bin/bash', '-c', 'hostname() { return 1; }\n' + command],
-                                capture_output=True, text=True)
-        assert result.returncode == 0, result.stderr
-        assert root.is_dir()
-        return RemoteCompleted(result.returncode, result.stdout, result.stderr)
-
+    bootstrap = str(source.parent)
+    monkeypatch.setattr('vaws_coordinator.provision.host_ops.DEFAULT_WORKDIR', bootstrap)
+    original_root_script = parity.prepare_isolated_root_script
+    monkeypatch.setattr(parity, 'prepare_isolated_root_script',
+                        lambda *a, **k: 'hostname() { return 1; }\n' + original_root_script(*a, **k))
     def control(actual_endpoint, job_id, action, **kwargs):
-        assert actual_endpoint == endpoint and root.is_dir()
+        assert actual_endpoint == {**endpoint, 'root': bootstrap, 'cwd': bootstrap}
+        if action == 'launch':
+            assert saved and not root.exists()
         actions.append(action)
         return control_job({'root': actual_endpoint['root'], 'job_id': job_id, 'action': action, **kwargs}, worker)
 
-    monkeypatch.setattr('remote_dev.core.ssh_transport.run_rpc_script', rpc)
+    monkeypatch.setattr('remote_dev.core.ssh_transport.run_rpc_script',
+                        lambda *a, **k: pytest.fail('root setup must share the owned job'))
     monkeypatch.setattr('vaws_coordinator.preparation_process.control', control)
     backend = RemoteBackend()
     monkeypatch.setattr(backend, '_prepare_native_view', lambda *a, **k: pytest.fail('publication must share the owned job'))
@@ -231,12 +230,13 @@ def test_backend_prepares_missing_root_before_real_owned_worker_launch_and_quiet
             on_preparation_job=lambda row: saved.append(copy.deepcopy(row)))
         assert isinstance(result, PreparedNativeView)
         assert result.attestation['execution_view']['source_id'] == fixed['id']
-        assert actions[0] == 'prepare-root-rpc' and actions.count('launch') == 1
+        assert actions[0] == 'launch' and actions.count('launch') == 1
         assert len({row['job_id'] for row in saved}) == 1
-        assert saved[-1]['endpoint'] == endpoint and saved[-1]['quiet'] is True
+        assert saved[-1]['endpoint']['root'] == bootstrap and saved[-1]['quiet'] is True
+        assert saved[-1]['stage_timings']['prepare-root'] >= 0
         assert saved[-1]['result']['exit_code'] == 0
         # A restarted controller can observe the exact job under the same root.
-        final = control(endpoint, saved[-1]['job_id'], 'status')
+        final = control(saved[-1]['endpoint'], saved[-1]['job_id'], 'status')
         assert final['quiet'] is True and final['processes'] == []
         assert final['result']['descendants_drained'] is True
     finally:

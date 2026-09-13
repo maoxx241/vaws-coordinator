@@ -1,11 +1,13 @@
 """Durable remote-dev ownership for coordinator preparation commands."""
 from __future__ import annotations
 
+import json
 import time
 import uuid
 
 from remote_dev.core.ssh_transport import RemoteCompleted
 from remote_dev.processes import control
+from vaws_coordinator.preparation_script import preparation_command
 
 
 class PreparationCancelled(RuntimeError):
@@ -42,22 +44,38 @@ def stop_preparation_process(record, save, *, force=False, drain_seconds=10):
 
 
 class PreparationProcess:
-    def __init__(self, endpoint, step, save, cancel_requested, *, timeout_seconds=7200):
+    def __init__(self, endpoint, step, save, cancel_requested, *, timeout_seconds=7200,
+                 setup=(), bootstrap_root=None):
         self.endpoint = dict(endpoint)
         self.step = step
         self.save = save
         self.cancel_requested = cancel_requested
         self.timeout_seconds = timeout_seconds
+        self.setup = list(setup)
+        self.bootstrap_root = bootstrap_root
 
     def run(self, script, *, on_output):
+        started = time.monotonic()
         if self.cancel_requested():
             raise PreparationCancelled("preparation cancelled before command launch")
-        record = {"endpoint": self.endpoint, "job_id": "prepare-" + uuid.uuid4().hex,
+        endpoint = dict(self.endpoint)
+        setup = self.setup
+        if setup:
+            endpoint.update(root=self.bootstrap_root, cwd=self.bootstrap_root)
+        command = preparation_command(script, setup=setup, cwd=(self.endpoint.get('cwd') or self.endpoint['root']) if setup else None)
+        record = {"endpoint": endpoint, "job_id": "prepare-" + uuid.uuid4().hex,
                   "step": self.step, "state": "pending", "quiet": False,
                   "stdout_offset": 0, "stderr_offset": 0}
+        def save_record(value):
+            value['elapsed_seconds'] = round(time.monotonic() - started, 6)
+            self.save(value)
+        if setup:
+            record['setup_steps'] = [step for step, _ in setup]
         # Persist BEFORE the first remote side effect. A lost launch reply can
         # always be observed or stopped by this exact job id without replay.
-        self.save(record)
+        save_record(record)
+        # A lost reply retains this exact job, never a second bootstrap/reset.
+        self.setup = []
         pending = {"stdout": "", "stderr": ""}
 
         def emit(observation, final=False):
@@ -67,6 +85,13 @@ class PreparationProcess:
                 pending[channel] = ""
                 for line in lines:
                     if final or line.endswith(("\n", "\r")):
+                        if channel == 'stderr' and line.startswith('__VAWS_PARITY_PROGRESS__='):
+                            try:
+                                event = json.loads(line.split('=', 1)[1])
+                                if event.get('phase') in record.get('setup_steps', []) and isinstance(event.get('elapsed_seconds'), (int, float)):
+                                    record.setdefault('stage_timings', {})[event['phase']] = event['elapsed_seconds']
+                            except (ValueError, TypeError):
+                                pass
                         on_output(channel, line)
                     else:
                         pending[channel] = line
@@ -74,25 +99,25 @@ class PreparationProcess:
         def exchange(wait=1000):
             # Keep the bounded yield/cancel cadence, but do not add a round
             # trip just because final output arrived before the exit receipt.
-            observation = control(self.endpoint, record["job_id"], "exchange",
+            observation = control(endpoint, record["job_id"], "exchange",
                                   stdout_offset=record["stdout_offset"], stderr_offset=record["stderr_offset"],
                                   max_bytes=32768, yield_time_ms=wait, wait_for_exit=True)
             emit(observation)
-            _remember(record, observation, self.save)
+            _remember(record, observation, save_record)
             return observation
 
         try:
-            observation = control(self.endpoint, record["job_id"], "launch", spec={
-                "command": script, "cwd": self.endpoint["cwd"], "env": {},
+            observation = control(endpoint, record["job_id"], "launch", spec={
+                "command": command, "cwd": endpoint["cwd"], "env": {},
                 "timeout_seconds": self.timeout_seconds, "interactive": False,
             }, authorization={}, stdout_offset=record["stdout_offset"],
                 stderr_offset=record["stderr_offset"], max_bytes=32768, yield_time_ms=1000,
                 wait_for_exit=True)
             emit(observation)
-            _remember(record, observation, self.save)
+            _remember(record, observation, save_record)
             while True:
                 if self.cancel_requested():
-                    if not stop_preparation_process(record, self.save):
+                    if not stop_preparation_process(record, save_record):
                         raise PreparationUncertain("preparation stop has not verified quiet; retained job can be stopped again")
                     while True:
                         observation = exchange(0)
@@ -113,5 +138,5 @@ class PreparationProcess:
         except (PreparationCancelled, PreparationUncertain):
             raise
         except Exception as exc:
-            _remember(record, {"state": "uncertain", "quiet": False, "error": str(exc)[:500]}, self.save)
+            _remember(record, {"state": "uncertain", "quiet": False, "error": str(exc)[:500]}, save_record)
             raise PreparationUncertain("preparation transport failed; retained owned job was not replayed") from exc

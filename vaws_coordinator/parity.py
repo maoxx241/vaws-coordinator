@@ -211,7 +211,7 @@ def materialize_fixed_sources(*, workspace_id: str, endpoint: dict, source_snaps
                 + '\nprint(json.dumps(result, separators=(",", ":")))\nVAWS_FIXED_SOURCES\n')
 
     def run():
-        script = command()
+        script = preparation_command(command())
         result = ssh_exec_stream(container, script, stream_progress=False,
                                  log_path=log_path, process=process)
         try:
@@ -231,7 +231,8 @@ def materialize_fixed_sources(*, workspace_id: str, endpoint: dict, source_snaps
             raise ParityUnavailable('fixed source materialization returned invalid missing objects')
         return missing
 
-    if native_publication is not None and len(command().encode('utf-8')) > 96 * 1024:
+    from vaws_coordinator.preparation_script import preparation_command, preparation_command_fits
+    if native_publication is not None and not preparation_command_fits(command()):
         # Large native metadata uses the existing separate publication job.
         # Every later inline pack is budgeted against this entire program.
         native_publication = None
@@ -275,7 +276,7 @@ def materialize_fixed_sources(*, workspace_id: str, endpoint: dict, source_snaps
                 # The owned worker invokes bash -c. Bound the whole argument,
                 # including base64, all repositories and the remote program,
                 # below Linux's per-argument limit; overflow uses Git below.
-                if len(command().encode('utf-8')) <= 96 * 1024:
+                if preparation_command_fits(command()):
                     if on_progress:
                         on_progress({'phase': 'inline-pack-ready', 'relpath': record.relpath,
                                      'transport': 'owned-rpc-pack', 'bytes': pack['bytes']})
@@ -1487,9 +1488,9 @@ def prepare_isolated_root_script(runtime_root: str) -> str:
     """Create or reset an isolated task root. Never pip-uninstall image packages."""
     hostname_repair = (
         'if command -v hostname >/dev/null 2>&1; then '
-        'h="$(hostname 2>/dev/null || true)"; '
+        '( flock -x 9; h="$(hostname 2>/dev/null || true)"; '
         'if [ -n "$h" ] && ! grep -q -F "$h" /etc/hosts 2>/dev/null; then '
-        'echo "127.0.0.1 $h" >> /etc/hosts; fi; fi'
+        'echo "127.0.0.1 $h" >> /etc/hosts; fi ) 9>/tmp/vaws-hostname.lock; fi'
     )
     return '\n'.join(
         [

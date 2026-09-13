@@ -117,7 +117,7 @@ def test_actual_managed_suffix_finishes_smoke_copy_and_atomic_ready(prepared, mo
     outputs, errors = [], []
     namespace = {key: value for key, value in vars(profile).items() if not key.startswith('__')}
     exec(compile(Path(cache.__file__).read_text(), '<cache>', 'exec'), namespace)
-    namespace.update(installed_native_files=lambda root: prepared['files'],
+    namespace.update(installed_dependency_identity=lambda: {}, installed_native_files=lambda root: prepared['files'],
                      print=lambda message, **kwargs: (errors if kwargs.get('file') else outputs).append(message),
                      SHARED_NATIVE_CACHE=str(tmp_path / 'cache'),
                      _build_namespace={'runtime_build_inputs': lambda *args: prepared['inputs']})

@@ -88,6 +88,11 @@ class RemoteBackend:
         endpoint = dict(runtime["endpoint"])
         return control(resolve_endpoint(endpoint), job_id, action, **parameters)
 
+    def wait_job(self, runtime, job_id, *, timeout_seconds=10):
+        """Wait inside the existing remote supervisor; no launch or lease change."""
+        return self.job(runtime, job_id, 'exchange', wait_for_exit=True,
+                        yield_time_ms=int(timeout_seconds * 1000), max_bytes=1)
+
     def submit_and_acquire(self, runtime, request):
         """Use the already persisted epoch for one host admission exchange."""
         return self.host(runtime, {**request, "action": "submit-acquire"})
@@ -370,7 +375,7 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
 
     def prepare_task_root(self, spec, *, sources, environment, donor_python=None, workspace_root=None,
                           source_snapshot=None, reuse=None,
-                          on_progress=None, log_dir=None, on_preparation_job=None, cancel_requested=None):
+                          on_progress=None, log_dir=None, on_preparation_job=None, cancel_requested=None, compile_scope=None):
         """Materialize fixed sources and prepare or reuse their native environment.
 
         Does not mutate ``donor_python`` site-packages. Image packages may be
@@ -412,11 +417,16 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
                     from vaws_coordinator.native_publication import NativeViewPublication
                     publication = NativeViewPublication(spec, reuse['runtime'], versions)
         container = SshEndpoint(host=endpoint["host"], port=int(endpoint["port"]), user=endpoint["user"])
+        pending_setup = []
         def owned_process(step):
+            nonlocal pending_setup
             if on_preparation_job is None:
                 return None
             from vaws_coordinator.preparation_process import PreparationProcess
-            return PreparationProcess(endpoint, step, on_preparation_job, cancel_requested or (lambda: False))
+            from vaws_coordinator.provision.host_ops import DEFAULT_WORKDIR
+            setup, pending_setup = pending_setup, []
+            return PreparationProcess(endpoint, step, on_preparation_job, cancel_requested or (lambda: False),
+                                      setup=setup, bootstrap_root=DEFAULT_WORKDIR)
 
         def check_cancel():
             if cancel_requested is not None and cancel_requested():
@@ -433,12 +443,14 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
 
         if log_dir is not None:
             Path(log_dir).mkdir(parents=True, exist_ok=True)
-        # The owned worker resolves root/cwd before running any script. Keep
-        # this short RPC even when materialization and publication share a job.
+        # The first owned job starts in the existing container workspace and
+        # establishes this execution's root before its materialization body.
         scripts = [("prepare-root", prepare_isolated_root_script(root))]
         if (native_recipe and (not reuse or reuse['kind'] != 'native')) or (not native_recipe and not donor_python):
             scripts.append(("create-venv", create_venv_script(root, python, donor_python)))
-        for step, script in scripts:
+        if on_preparation_job is not None:
+            pending_setup = scripts
+        for step, script in (() if on_preparation_job is not None else scripts):
             check_cancel()
             log = progress(step)
             if step == "prepare-root":
@@ -516,18 +528,22 @@ print(json.dumps({'qualified': True, 'build_key': manifest['build_key'], **({'ma
         def install(step):
             nonlocal compiled_native
             log = progress(step)
-            run_runtime_install_step(
-                container=container,
-                runtime_root=root,
-                marker_dirname=DEFAULT_MARKER_DIRNAME,
-                container_identity=identity,
-                step=step,
-                stream_progress=False,
-                python=python,
-                on_progress=lambda event, step=step: progress(step, event),
-                log_path=log,
-                process=owned_process(step),
-            )
+            from contextlib import nullcontext
+            scope = (compile_scope(step) if compile_scope and step in
+                     {'install-vllm', 'install-vllm-ascend', 'install-vllm-ascend-incremental'} else nullcontext())
+            with scope:
+                run_runtime_install_step(
+                    container=container,
+                    runtime_root=root,
+                    marker_dirname=DEFAULT_MARKER_DIRNAME,
+                    container_identity=identity,
+                    step=step,
+                    stream_progress=False,
+                    python=python,
+                    on_progress=lambda event, step=step: progress(step, event),
+                    log_path=log,
+                    process=owned_process(step),
+                )
             if step == 'install-vllm-ascend':
                 compiled_native = True
 

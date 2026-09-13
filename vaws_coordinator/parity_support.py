@@ -317,6 +317,7 @@ def ssh_exec_stream(
     process=None,
 ) -> SshStreamingResult:
     from remote_dev.core.ssh_transport import run_stream
+    from vaws_coordinator.preparation_script import preparation_command
 
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
@@ -341,7 +342,7 @@ def ssh_exec_stream(
         stderr_parts.append(text)
 
     completed = (process.run(script, on_output=on_output) if process is not None else run_stream(
-        _remote_endpoint(endpoint, long_stream=True), script,
+        _remote_endpoint(endpoint, long_stream=True), preparation_command(script),
         merge_stderr=False, on_output=on_output,
     ))
     stdout = ''.join(stdout_parts)
