@@ -300,6 +300,69 @@ def test_explicit_empty_native_map_stays_empty(tmp_path):
     context = store.attach("codex", "native", str(root))
     context = store.bind_native_sources(context, sources={})
     assert context["source_defaults"] == {"origin": "native-prepared", "sources": {}}
+    context = store.bind_native_sources(context)
+    assert context["source_defaults"] == {"origin": "native-prepared", "sources": {}}
+
+
+@pytest.mark.parametrize("client", ["claude", "codex", "cursor", "grok", "kimi"])
+def test_detached_cli_resume_revalidates_prepared_sources_not_original_cwd(tmp_path, client):
+    from test_execution_inputs import git
+    original, editing = repo(tmp_path / "original"), repo(tmp_path / "editing")
+    store = AgentSessions(tmp_path / "sessions")
+    event = {"hook_event_name": "SessionStart", "session_id": "native", "cwd": str(original)}
+    handle(client, event, store)
+    initial = store.native_context(client, "native")
+    store.bind_native_sources(initial, sources={"workspace": str(editing)})
+    handle(client, {**event, "hook_event_name": "SessionEnd"}, store)
+    assert store.context(initial["attachment"]["id"])["attachment"]["state"] == "detached"
+    (editing / "resumed.txt").write_text("task revision advanced\n")
+    git(editing, "add", "resumed.txt")
+    git(editing, "commit", "-m", "advance selected repository")
+    # The real CLI carries only native identity and the original cwd. It does
+    # not resubmit the consumer's prepared map on SessionStart.
+    handle(client, {**event, "source": "resume"}, store)
+    resumed = store.native_context(client, "native")
+    assert resumed["session"]["id"] == initial["session"]["id"]
+    assert resumed["attachment"]["id"] == initial["attachment"]["id"]
+    assert resumed["source_defaults"]["origin"] == "native-prepared"
+    assert resumed["source_defaults"]["sources"]["workspace"]["path"] == str(editing)
+    assert resumed["source_defaults"]["sources"]["workspace"]["head_at_bind"] == git(editing, "rev-parse", "HEAD")
+    store.bind_sources(resumed, {})
+    handle(client, {**event, "hook_event_name": "SessionEnd"}, store)
+    handle(client, {**event, "source": "resume"}, store)
+    assert store.native_context(client, "native")["source_defaults"] == {"origin": "explicit", "sources": {}}
+    # A different native task in the same checkout must not inherit this W.
+    handle(client, {**event, "session_id": "other"}, store)
+    other = store.native_context(client, "other")
+    assert other["session"]["id"] != initial["session"]["id"]
+    assert {row["path"] for row in other["source_defaults"]["sources"].values()} == {str(original)}
+
+
+def test_detached_resume_in_different_cwd_drops_prepared_selection(tmp_path):
+    original, editing, moved = (repo(tmp_path / name) for name in ("original", "editing", "moved"))
+    store = AgentSessions(tmp_path / "sessions")
+    event = {"hook_event_name": "SessionStart", "session_id": "native", "cwd": str(original)}
+    handle("codex", event, store, sources={"workspace": str(editing)})
+    handle("codex", {**event, "hook_event_name": "SessionEnd"}, store)
+    handle("codex", {**event, "cwd": str(moved), "source": "resume"}, store)
+    result = store.native_context("codex", "native")["source_defaults"]
+    assert result["origin"] == "native-cwd"
+    assert {row["path"] for row in result["sources"].values()} == {str(moved)}
+
+
+def test_lost_prepared_repository_stays_unknown_across_repeated_cli_resumes(tmp_path):
+    original, editing = repo(tmp_path / "original"), repo(tmp_path / "editing")
+    store = AgentSessions(tmp_path / "sessions")
+    event = {"hook_event_name": "SessionStart", "session_id": "native", "cwd": str(original)}
+    handle("codex", event, store, sources={"workspace": str(editing)})
+    hidden = tmp_path / "temporarily-unavailable"
+    editing.rename(hidden)
+    for _ in range(2):
+        handle("codex", {**event, "hook_event_name": "SessionEnd"}, store)
+        handle("codex", {**event, "source": "resume"}, store)
+        result = store.native_context("codex", "native")["source_defaults"]
+        assert result["origin"] == "unknown" and result["sources"] == {}
+        assert "Prepared native source roots are unavailable" in result["reason"]
 
 
 def test_native_prepared_roots_capture_ignored_child_edits(tmp_path):

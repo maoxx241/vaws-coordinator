@@ -264,6 +264,15 @@ class AgentSessions:
     def bind_native_sources(self, context: dict, *, sources: dict[str, str] | None = None) -> dict:
         """Bind consumer-selected roots or native cwd, without changing task defaults."""
         attachment = self.context(context["attachment"]["id"])["attachment"]
+        if sources is None and attachment.get("source_error"):
+            raise ValueError(attachment["source_error"])
+        if sources is None and attachment.get("source_mode") == "native-prepared":
+            # A native CLI may resume in its original checkout after the
+            # consumer selected an independent editing workspace. attach()
+            # already discards automatic sources when the actual cwd changes.
+            # Revalidate the selected repositories (including their current
+            # HEADs); absence of a new map does not revoke that selection.
+            sources = {name: reference["path"] for name, reference in attachment["sources"].items()}
         if sources is None:
             reference = worktree_reference(attachment["cwd"])
             common = Path(reference["git_common_dir"])
