@@ -11,7 +11,7 @@ license = "MIT"
 requires-python = ">=3.11"
 authors = [{ name = "Qi Mao" }]
 dependencies = [
-    "vaws-diagnostics @ git+https://github.com/vllm-ascend-workspace/vaws-diagnostics@3304661fd44c1f10e26d88b48e5d63dce1886810",
+    "vaws-diagnostics @ git+https://github.com/vllm-ascend-workspace/vaws-diagnostics@3595e4e5ae776a1728099f237792ffb022ae12c8",
     "vaws-remote-dev>=0.9.0",
     "setuptools-scm>=8",
 ]
