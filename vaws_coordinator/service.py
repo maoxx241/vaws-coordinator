@@ -1435,7 +1435,7 @@ class CoordinatorService(TaskMessages):
                         continue
                     for key in ('preparation_timings', 'native_cache', 'native_smoke_executed'):
                         if key in value:
-                            entry[key] = value[key]
+                            entry.setdefault(key, value[key])
                     if "manifest_zlib_base64" in value:
                         captured = _captured_manifest(receipt)
                     elif value.get("profile_key") and value.get("build_key") and "files" in value:
