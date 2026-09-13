@@ -8,7 +8,7 @@ from pathlib import Path
 
 from vaws_coordinator.agent_session import AgentSessions, load_context
 from vaws_coordinator.client_paths import client_path
-from vaws_coordinator.placement import normalize_environment, normalize_resources, role_plan, validate_user_env
+from vaws_coordinator.placement import normalize_environment, normalize_resources, role_plan, validate_user_env, validate_wait
 from vaws_coordinator.ready_runtime import safe_id
 from vaws_coordinator.state_paths import coordinator_state_dir
 from vaws_coordinator.user_identity import load_github_identity
@@ -177,7 +177,6 @@ class TaskClient:
         shares one physical NPU with external processes. Other managed leases
         remain exclusive; stopping this execution only stops its own family.
         """
-        from vaws_coordinator.service import validate_wait
         if wait_until is not None:
             validate_wait(wait_until, wait_timeout_seconds)
         script = None
@@ -319,7 +318,6 @@ class TaskClient:
         The owner uses a condition notification and its existing supervision
         cadence; terminal logs are fetched once and retained in the execution.
         """
-        from vaws_coordinator.service import validate_wait
         validate_wait(until, timeout_seconds)
         self._require_execution_id(execution_id)
         return self._with_notifications(self.coordinator.wait(str(self.store.state_dir), self.user, execution_id,

@@ -10,7 +10,6 @@ from __future__ import annotations
 import getpass
 import hashlib
 import json
-import math
 import os
 import secrets
 import socket
@@ -41,6 +40,7 @@ from vaws_coordinator.placement import (
     provisionable_recipe,
     role_plan,
     runtime_matches,
+    validate_wait,
 )
 from vaws_coordinator.provision.task_environment import TaskRootBusy
 from vaws_coordinator.preparation_process import (
@@ -61,16 +61,7 @@ LEASE_READY = {"granted", "starting", "active"}
 PERMANENT_ERRORS = (ValueError, PermissionError, ExecutionRequestError, TaskRootBusy)
 CLIENT_TIMEOUT_SECONDS = 60.0
 STOP_WAIT_SECONDS = 30.0
-MAX_WAIT_SECONDS = 600
 LOADED_RUNTIMES = [process_identity(name) for name in ("vaws-coordinator", "vaws-remote-dev")]
-
-
-def validate_wait(until, timeout_seconds):
-    if until not in {"running", "released"}:
-        raise ValueError("until must be running or released")
-    if (isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float))
-            or not math.isfinite(timeout_seconds) or not 0 <= timeout_seconds <= MAX_WAIT_SECONDS):
-        raise ValueError("wait timeout_seconds must be finite and between 0 and 600")
 
 
 def socket_path(state_dir: Path) -> Path:
