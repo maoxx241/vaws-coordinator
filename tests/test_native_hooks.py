@@ -339,3 +339,21 @@ def test_missing_prepared_child_never_becomes_implicit_source_free_execution(tmp
     repo(source / "missing")
     restored = store.bind_native_sources(context, sources=roots)
     assert "source_error" not in restored["attachment"]
+
+
+def test_prepared_roots_keep_global_kimi_silent_outside_git_project(tmp_path, monkeypatch, capsys):
+    from vaws_coordinator.hooks.vaws_session import in_project_scope
+    project = repo(tmp_path / "project")
+    outside = tmp_path / "non-git"
+    outside.mkdir()
+    sources = {"workspace": str(project)}
+    assert not in_project_scope(outside, project, sources=sources)
+    monkeypatch.setattr("sys.argv", ["hook", "--client", "kimi", "--project", str(project)])
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps({"hook_event_name": "UserPromptSubmit",
+                        "session_id": "unrelated", "cwd": str(outside)})))
+    monkeypatch.setattr("vaws_coordinator.hooks.vaws_session.AgentSessions",
+                        Mock(side_effect=AssertionError("outside scope must not open registry")))
+    capsys.readouterr()
+    assert main(sources=sources) == 0
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "" and captured.err == ""

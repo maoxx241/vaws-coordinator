@@ -90,12 +90,15 @@ def in_project_scope(cwd: Path, project: Path, *, sources: dict[str, str] | None
     if sources is not None:
         # The consumer supplies explicitly prepared roots. Never discover
         # arbitrary nested repositories or infer task association from them.
-        actual = subprocess.run(
-            ["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
-            capture_output=True, text=True, encoding="utf-8", timeout=5, check=True,
-        ).stdout.strip()
-        if Path(client_path(actual)).resolve() in {Path(client_path(path)).resolve() for path in sources.values()}:
-            return True
+        try:
+            actual = subprocess.run(
+                ["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
+                capture_output=True, text=True, encoding="utf-8", timeout=5, check=True,
+            ).stdout.strip()
+            if Path(client_path(actual)).resolve() in {Path(client_path(path)).resolve() for path in sources.values()}:
+                return True
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pass  # Preserve the original non-Git initialization/outside scope.
     inside = project in cwd.parents
     try:
         common = git_common_directory(project)
