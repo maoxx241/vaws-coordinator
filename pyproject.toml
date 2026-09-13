@@ -4,15 +4,15 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vaws-coordinator"
-version = "0.5.0.dev2"
+version = "0.5.0.dev3"
 description = "Local VAWS coordinator: task stdio MCP and host NPU allocation"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
 authors = [{ name = "Qi Mao" }]
 dependencies = [
-    "vaws-diagnostics @ git+https://github.com/vllm-ascend-workspace/vaws-diagnostics@3595e4e5ae776a1728099f237792ffb022ae12c8",
-    "vaws-remote-dev>=0.9.0",
+    "vaws-diagnostics @ git+https://github.com/vllm-ascend-workspace/vaws-diagnostics@a9135c13bcd3ec88dd3a7c2f454a57f9bee9be14",
+    "vaws-remote-dev>=0.9.1",
     "setuptools-scm>=8",
 ]
 
