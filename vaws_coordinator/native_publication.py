@@ -39,7 +39,8 @@ class NativeViewPublication:
 
     def wrap_program(self, materialize_program: str) -> str:
         """The supplied package program sets result; missing never publishes."""
-        publish = self._publish_program() + "result['native_view'] = _native_reply\n"
+        publish = (self._publish_program() + "result['native_view'] = _native_reply\n"
+                   + "result.setdefault('preparation_timings', {}).update(_native_reply['preparation_timings'])\n")
         body = (materialize_program + "\nif result.get('status') == 'materialized':\n"
                 + '\n'.join('    ' + line for line in publish.splitlines())
                 + '\nprint(json.dumps(result, separators=(",", ":")))\n')

@@ -87,6 +87,8 @@ def test_actual_bash_argument_composes_materialization_and_fixed_native_proof(do
         assert actual['files'] == publication.donor['files']
         assert actual['execution_view']['source_id'] == request['source_id']
         assert result['commits'] == {row['relpath']: row['commit'] for row in request['records']}
+        timings = result['preparation_timings']
+        assert 0 <= timings['source_metadata'] <= timings['native_publication']
     print(json.dumps({'composite_command_bytes': size, 'status': result['status'], 'native_published': not missing}))
 
 
@@ -138,6 +140,8 @@ def test_real_materializer_api_budgets_native_modules_and_inline_git_pack(donor,
         endpoint={'host': 'fixture', 'port': 22, 'user': 'fixture', 'root': request['root']},
         native_publication=publication, container_cache_root=str(source.parent / 'cache'))
     assert publication.accept(result['native_view'])['execution_view']['source_id'] == fixed['id']
+    assert set(result['preparation_timings']) == {'materialize', 'source_metadata', 'native_publication'}
+    assert all(value >= 0 for value in result['preparation_timings'].values())
     assert len(commands) == (2 if edit_bytes else 1)
     assert len(pushes) == (1 if edit_bytes == 100000 else 0)
     if edit_bytes:

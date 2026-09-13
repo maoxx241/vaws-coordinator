@@ -199,7 +199,9 @@ def materialize_fixed_sources(*, workspace_id: str, endpoint: dict, source_snaps
                 row['local_bases'] = bases
     def command():
         program = (inspect.getsource(copy_fixed_objects) + '\n' + inspect.getsource(_materialize_fixed)
-                   + '\nimport json\nresult = _materialize_fixed(' + repr(request) + ')\n')
+                   + '\nimport json, time\n_materialize_started = time.monotonic()\n'
+                   + 'result = _materialize_fixed(' + repr(request) + ')\n'
+                   + "result['preparation_timings'] = {'materialize': time.monotonic() - _materialize_started}\n")
         if build_source is not None:
             program += (inspect.getsource(_write_materialized_build_source)
                         + "\nif result.get('status') == 'materialized':\n"

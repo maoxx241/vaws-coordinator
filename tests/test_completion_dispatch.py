@@ -29,7 +29,9 @@ def test_public_run_wait_wakes_on_completion_without_a_ticker(monkeypatch):
     service = task.client.coordinator
     service._async_progress = True
     def wait(runtime, key, **kwargs):
-        task.backend.jobs[key].update(state='succeeded', quiet=True)
+        task.backend.jobs[key].update(state='succeeded', quiet=True, stdout='final business output', stderr='',
+                                      result={'descendants_drained': True},
+                                      receipt={**task.backend.jobs[key].get('receipt', {}), 'job_id': key})
         return copy.deepcopy(task.backend.jobs[key])
     monkeypatch.setattr(task.backend, 'wait_job', wait, raising=False)
     try:
@@ -37,9 +39,35 @@ def test_public_run_wait_wakes_on_completion_without_a_ticker(monkeypatch):
                                  wait_until='released', wait_timeout_seconds=5)
         assert result['state'] == 'succeeded' and result['resources_released'] is True
         assert 'tail' in result
+        assert result['stdout'] == 'final business output'
+        assert ('job', 'tail') not in task.backend.calls
     finally:
         service._stopped.set()
         task.tearDown()
+
+
+@pytest.mark.parametrize('change', [None, 'running', 'active-lease', 'status-only', 'missing-stderr',
+                                  'draining', 'wrong-job', 'unquiet', 'unknown'])
+def test_terminal_tail_reuse_requires_same_drained_job_and_explicit_output(running, change):
+    pool, backend, job = running
+    remote = {'state': 'succeeded', 'quiet': True, 'receipt': {'job_id': job['job_id']},
+              'result': {'descendants_drained': True}, 'stdout': 'final', 'stderr': ''}
+    job.update(state='succeeded', lease_state='released', remote=remote)
+    if change == 'running': job['state'] = 'running'
+    elif change == 'active-lease': job['lease_state'] = 'active'
+    elif change == 'status-only': remote.pop('stdout'); remote.pop('stderr')
+    elif change == 'missing-stderr': remote.pop('stderr')
+    elif change == 'draining': remote['result']['descendants_drained'] = False
+    elif change == 'wrong-job': remote['receipt']['job_id'] = 'earlier-job'
+    elif change == 'unquiet': remote['quiet'] = False
+    elif change == 'unknown': remote['unknown'] = True
+    with pool.transaction() as db:
+        pool.put(db, 'job', job)
+    backend.calls.clear()
+    result = pool.managed_control('alice', job['id'], 'tail')
+    assert (('job', 'tail') in backend.calls) is bool(change)
+    if change is None:
+        assert result['remote']['stdout'] == 'final' and result['remote']['stderr'] == ''
 
 
 def test_completion_event_releases_without_a_second_status_poll(running, monkeypatch):

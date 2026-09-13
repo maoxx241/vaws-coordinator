@@ -62,10 +62,12 @@ If a bounded wait returns `wait_timed_out=True`, inspect its facts and wait on
 the same id again as needed; that timeout does not stop or resubmit the work.
 Wait budgets are 0–600 seconds and are separate from the command's execution
 timeout. The owner handles waiting; no Agent status loop is required. Terminal
-wait returns `stdout` / `stderr` / `tail`, fetched once and cached on the execution.
+wait returns `stdout` / `stderr` / `tail`, collected once and cached on the execution.
 A slow log read can return `logs_pending=True`; a failed read returns `tail_error`.
 Neither changes the business state or release facts. Waiting again on the same
-reference reuses the collection. Explicit tail remains available for a fresh log read.
+reference reuses the collection. A terminal exchange's explicit stdout/stderr may
+also satisfy tail for that same verified drained and released job; incomplete,
+status-only or different-job observations still require a log read.
 If observation fails after admission, `wait_error` retains the admitted execution
 reference; continue observing that reference instead of submitting again.
 For progress use
@@ -198,6 +200,13 @@ execution returns its stored observation immediately and explicitly marks a
 requested refresh as deferred. Cached stale or missing timestamps schedule a
 refresh on the existing execution worker; state/error/release fields remain visible
 and the reply reports its actual sample age rather than claiming fresh remote facts.
+
+Recorded preparation evidence includes available `preparation_timings` in seconds.
+For a combined source/native job, `materialize` measures fixed Git materialization,
+`native_publication` measures verification/copy/publication, and `source_metadata`
+is a subphase of native publication, not an additional duration to sum. These
+remote monotonic durations exclude transport and the surrounding owned-job setup;
+the existing owner stage duration includes those costs.
 
 ## Install
 

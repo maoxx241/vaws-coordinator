@@ -98,6 +98,16 @@ class ManagedExecution:
             elif action not in {"status", "tail"}:
                 raise ValueError("managed execution action must be status, tail or stop")
         if action == "tail":
+            remote = job.get('remote') or {}
+            # Completion exchange already returns a bounded tail. Reuse only
+            # this exact drained job, never an earlier/status-only snapshot.
+            if (job['state'] in JOB_TERMINAL and job.get('lease_state') in LEASE_TERMINAL
+                    and remote.get('state') in JOB_TERMINAL and remote.get('quiet') is True
+                    and not remote.get('unknown')
+                    and (remote.get('receipt') or {}).get('job_id') == job['job_id']
+                    and (remote.get('result') or {}).get('descendants_drained') is True
+                    and all(isinstance(remote.get(key), str) for key in ('stdout', 'stderr'))):
+                return job
             return {**job, "remote": self.backend.job(runtime, job["job_id"], "tail")}
         return self.managed_advance(job_id) if job["state"] not in JOB_TERMINAL else job
 

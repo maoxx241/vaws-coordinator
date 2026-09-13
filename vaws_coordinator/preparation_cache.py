@@ -93,7 +93,7 @@ def write_source_metadata(root: Path, versions: dict, distributions: dict | None
             stream.write('\n__commit_id__ = commit_id = ' + repr(row.get('source_head')) + '\n')
 
 
-def copy_native_view(root: Path, source_root: Path, manifest: dict, versions: dict, *, verify_donor=True) -> dict:
+def copy_native_view(root: Path, source_root: Path, manifest: dict, versions: dict, *, verify_donor=True, timings=None) -> dict:
     # `verify`, `checked_file` and `capture` are injected from runtime_profile
     # into the remote preparation script; this module has no remote imports.
     if verify_donor:
@@ -113,7 +113,11 @@ def copy_native_view(root: Path, source_root: Path, manifest: dict, versions: di
         # view must retain the previously verified bytes, never re-attest them.
         if file_digest(checked_file(root, name)) != expected['sha256']:
             raise ValueError('copied artifact differs from verified donor hash: ' + name)
+    import time
+    metadata_started = time.monotonic()
     write_source_metadata(root, versions)
+    if timings is not None:
+        timings['source_metadata'] = time.monotonic() - metadata_started
     toolchain = build_toolchain_from_logs(source_root)
     return {'kind': 'native', 'source_root': str(source_root), 'build_key': manifest['build_key'],
             'soc': manifest['profile']['soc'], 'compiler': manifest['profile']['compiler'],
@@ -432,6 +436,9 @@ def prepare_native_view(root: Path, source_root: Path, donor: dict, args: dict) 
     and original import evidence are reused, not re-captured or marked passed.
     The caller has already materialized and checked the fixed Git snapshot.
     """
+    import time
+    started = time.monotonic()
+    timings = {}
     if digest(donor) != args['donor_manifest_digest']:
         raise ValueError('native donor manifest changed; inspect or repair that environment')
     verify_environment(source_root, donor)
@@ -444,7 +451,7 @@ def prepare_native_view(root: Path, source_root: Path, donor: dict, args: dict) 
                 raise ValueError('native reuse inputs changed: ' + name + '/' + field)
     if args['build_env'] != donor['profile']['build_env']:
         raise ValueError('native reuse build environment changed')
-    reuse = copy_native_view(root, source_root, donor, args['versions'], verify_donor=False)
+    reuse = copy_native_view(root, source_root, donor, args['versions'], verify_donor=False, timings=timings)
     current = copy.deepcopy(donor)
     current['runtime_root'] = str(root.resolve())
     profile = current['profile']
@@ -509,8 +516,10 @@ def prepare_native_view(root: Path, source_root: Path, donor: dict, args: dict) 
     os.replace(temporary, marker)
     # Files have not changed: the caller already owns their complete identity.
     # Return only the new view facts rather than another 300 KB native manifest.
-    return {'manifest': {key: value for key, value in current.items() if key != 'files'},
-            'manifest_digest': digest(current)}
+    result = {'manifest': {key: value for key, value in current.items() if key != 'files'},
+              'manifest_digest': digest(current)}
+    timings['native_publication'] = time.monotonic() - started
+    return {**result, 'preparation_timings': timings}
 
 
 REMOTE_NATIVE_VIEW_SUFFIX = r'''
