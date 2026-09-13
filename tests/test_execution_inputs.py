@@ -254,24 +254,39 @@ def test_four_allowed_hosts_prepare_concurrently_and_preserve_role_progress(clie
     assert set(persisted["role_progress"]) == {role["name"] for role in roles}
 
 
-def test_cancelled_group_skips_preparation_waiting_for_same_host(client):
+@pytest.mark.parametrize("phase", ["private", "compile"])
+def test_cancelled_group_stops_before_launch_and_skips_waiting_compiler(client, phase):
     roles = [{"name": name, "host": "same-host", "command": "true", "npu_count": 0} for name in ("one", "two")]
     client.run("true", sources={}, topology={"roles": roles})
     row = client.store.executions(client.context["session"]["id"])[0]
     catalog = [{"runtime_id": role["name"], "host": "same-host", "user": "alice"} for role in roles]
     prepared = []
+    barrier = threading.Barrier(2)
 
-    def prepare(store, user, execution, role, environment, donor):
-        prepared.append(role["name"])
-        stored = store.executions(execution["session_id"])[0]
-        stored["cancel_requested"] = True
-        store.save_execution(stored)
-        return {"id": role["name"]}
+    def prepare_environment(*args, **kwargs):
+        # Both private preparations are in flight before cancellation. Only
+        # the actual compile_scope serializes same-host compiler work.
+        barrier.wait(timeout=5)
+
+        def complete_then_cancel():
+            prepared.append(kwargs["role_name"])
+            stored = client.store.executions(row["session_id"])[0]
+            stored["cancel_requested"] = True
+            client.store.save_execution(stored)
+            return {"id": kwargs["role_name"]}
+
+        if phase == "compile":
+            with kwargs["compile_scope"]("install-vllm-ascend"):
+                return complete_then_cancel()
+        return complete_then_cancel()
 
     with patch.object(client.pool, "catalog", return_value=catalog), \
          patch.object(client.coordinator, "_donor_for_role", return_value={"host": "same-host"}), \
-         patch.object(client.coordinator, "_prepare_role", side_effect=prepare):
-        result = client.coordinator._place_or_prepare(client.store, "alice", row, roles, {})
-    assert result["status"] == "waiting"
-    assert "cancellation" in result["reason"]
-    assert len(prepared) == 1
+         patch("vaws_coordinator.provision.prepare_task_environment", side_effect=prepare_environment), \
+         patch.object(client.pool, "checkout", side_effect=AssertionError("cancelled preparation must not checkout")) as checkout, \
+         patch.object(client.pool, "managed_start", side_effect=AssertionError("cancelled preparation must not launch")) as launch:
+        result = client.coordinator._progress(client.store, "alice", row)
+    assert result["state"] == "cancelled" and result["resources_released"] is True
+    assert len(prepared) == (1 if phase == "compile" else 2)
+    checkout.assert_not_called()
+    launch.assert_not_called()
