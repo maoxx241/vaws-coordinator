@@ -43,6 +43,26 @@ def test_configured_user_drives_task_and_default_container(tmp_path, monkeypatch
     assert owner.mock_calls == []
 
 
+def test_confirmed_login_only_binds_local_task_without_github_authentication(tmp_path, monkeypatch):
+    path = tmp_path / 'identity-only.json'
+    path.write_text(json.dumps({'schema': 'vaws.github.v1', 'login': 'Alice'}), encoding='utf-8')
+    monkeypatch.setenv(IDENTITY_FILE_ENV, str(path))
+    native = context(tmp_path)
+    owner = Mock()
+    client = TaskClient(native['context_file'], service=owner)
+    assert coordinator_user() == client.user == 'alice'
+    assert client.context['session']['github_identity'] == {'schema': 'vaws.github.v1', 'login': 'alice'}
+    path.unlink()
+    assert TaskClient(native['context_file'], service=owner).user == 'alice'
+    assert owner.mock_calls == []
+
+
+@pytest.mark.parametrize('user_id', [None, True, False, 0, -1, 1.5, '42'])
+def test_present_numeric_id_still_requires_a_positive_integer(tmp_path, user_id):
+    with pytest.raises(ValueError, match='positive numeric github_user_id'):
+        load_github_identity(identity(tmp_path, user_id=user_id))
+
+
 def test_resume_and_explicit_child_keep_bound_user_across_workspace_change(tmp_path, monkeypatch):
     first = context(tmp_path)
     alice = TaskClient(first["context_file"], identity_file=identity(tmp_path), service=Mock())
@@ -83,7 +103,6 @@ def test_explicit_identity_path_wins_without_changing_process_environment(tmp_pa
     ("{broken", "not valid UTF-8 JSON"),
     ('{"schema":"other"}', "schema vaws.github.v1"),
     ('{"schema":"vaws.github.v1","login":"bad/login","github_user_id":42}', "invalid personal login"),
-    ('{"schema":"vaws.github.v1","login":"alice"}', "positive numeric github_user_id"),
 ])
 def test_invalid_configured_identity_explains_the_error_and_does_not_bind_root(tmp_path, document, reason):
     path = tmp_path / "identity.json"

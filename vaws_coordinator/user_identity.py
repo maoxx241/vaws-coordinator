@@ -3,6 +3,8 @@
 Shared-root deployments use this configured user for naming and coordination.
 It is not an authentication token or an authorization boundary. This module
 performs no network requests and never searches for a consumer workspace.
+The confirmed login is sufficient for local attribution. A numeric GitHub ID
+may accompany an authenticated snapshot, but is never required for local use.
 """
 from __future__ import annotations
 
@@ -35,6 +37,7 @@ def load_github_identity(identity_file=None) -> dict | None:
     if not isinstance(login, str) or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?", login):
         raise ValueError(f"Configured GitHub identity file {path} has an invalid personal login")
     user_id = value.get("github_user_id")
-    if type(user_id) is not int or user_id <= 0:
+    if "github_user_id" in value and (type(user_id) is not int or user_id <= 0):
         raise ValueError(f"Configured GitHub identity file {path} requires a positive numeric github_user_id")
-    return {"schema": "vaws.github.v1", "login": login.lower(), "github_user_id": user_id}
+    return {"schema": "vaws.github.v1", "login": login.lower(),
+            **({"github_user_id": user_id} if "github_user_id" in value else {})}
